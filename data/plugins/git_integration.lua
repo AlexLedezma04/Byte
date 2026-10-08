@@ -435,60 +435,439 @@ local old_sv_pressed = StatusView.on_mouse_pressed
 function StatusView:on_mouse_pressed(button, x, y, clicks)
   if self.git_click_x and x >= self.git_click_x then
     core.set_active_view(core.last_active_view)
-    command.perform("git:diff-all")
+    command.perform("git:show-changes")
     return
   end
   return old_sv_pressed(self, button, x, y, clicks)
 end
 
--- diff view
-local DiffView = DocView:extend()
-DiffView.is_git_diff_view = true
+-- compare view: HEAD on the left (read-only), the working copy on the right.
+local CompareView = DocView:extend()
+CompareView.is_git_diff_view = true
 
-function DiffView:draw_line_body(line, x, y)
-  local text = self.doc.lines[line] or ""
-  local c = colors()
-  local bg
-  if text:match("^@@") then bg = style.accent
-  elseif text:match("^%+") and not text:match("^%+%+%+") then bg = c.added
-  elseif text:match("^%-") and not text:match("^%-%-%-") then bg = c.deleted
-  elseif text:match("^diff ") then bg = style.dim end
-  if bg then
-    local color = { bg[1], bg[2], bg[3], text:match("^diff ") and 60 or 45 }
-    local gw = self:get_gutter_width()
-    renderer.draw_rect(self.position.x + gw, y, self.size.x - gw, self:get_line_height(), color)
-  end
-  return DiffView.super.draw_line_body(self, line, x, y)
+-- read-only Doc used only for syntax highlighting
+local function snapshot_doc(filename, lines)
+  local d = Doc()
+  d.filename = filename
+  d.lines = {}
+  for i, l in ipairs(lines) do d.lines[i] = l .. "\n" end
+  if #d.lines == 0 then d.lines[1] = "\n" end
+  d:reset_syntax()
+  d.highlighter:reset()
+  return d
 end
 
-local function open_diff(title, text)
-  local doc = Doc()
-  doc:insert(1, 1, text ~= "" and text or "No changes.\n")
-  doc:clean()
-  doc.get_name = function() return title end
+-- pairs old/new lines into rows; changed regions are padded so both sides align
+local function build_rows(old, new, hunks)
+  local rows, starts = {}, {}
+  local i, j = 1, 1
+  for _, h in ipairs(hunks) do
+    while i < h.old_start do
+      rows[#rows + 1] = { l = i, r = j, kind = "same" }
+      i, j = i + 1, j + 1
+    end
+    starts[#starts + 1] = #rows + 1
+    for k = 0, math.max(h.old_count, h.new_count) - 1 do
+      rows[#rows + 1] = {
+        l = k < h.old_count and h.old_start + k or nil,
+        r = k < h.new_count and h.new_start + k or nil,
+        kind = h.kind,
+      }
+    end
+    i, j = h.old_start + h.old_count, h.new_start + h.new_count
+  end
+  while i <= #old or j <= #new do
+    rows[#rows + 1] = { l = i <= #old and i or nil, r = j <= #new and j or nil, kind = "same" }
+    i, j = i + 1, j + 1
+  end
+  return rows, starts
+end
+
+local function is_binary_file(abs)
+  local fp = io.open(abs, "rb")
+  if not fp then return false end
+  local head = fp:read(8000) or ""
+  fp:close()
+  return head:find("\0", 1, true) ~= nil
+end
+
+local function read_only(doc)
   doc.insert = function() end
   doc.remove = function() end
   doc.save = function() end
-  local node = core.root_view:get_active_node()
-  local view = DiffView(doc)
-  node:add_view(view)
-  core.root_view.root_node:update_layout()
-  view.scroll.to.y = 0
+  return doc
+end
+
+function CompareView:new(abs, status)
+  self.abs, self.status = abs, status
+  local doc
+  if status ~= "deleted" then
+    self.file_binary = is_binary_file(abs)
+    if not self.file_binary then
+      local ok, d = core.try(core.open_doc, abs)
+      if ok then doc = d end
+    end
+  end
+  self.read_only = doc == nil
+  CompareView.super.new(self, doc or read_only(snapshot_doc(abs, {})))
+  self.rows, self.hunk_starts, self.line_row = {}, {}, {}
+  self.old_max_width = 0
+end
+
+function CompareView:get_name()
+  local post = (not self.read_only and self.doc:is_dirty()) and "*" or ""
+  return "Diff: " .. common.basename(self.abs) .. post
+end
+
+function CompareView:get_header_height()
+  return style.font:get_height() + style.padding.y * 2
+end
+
+function CompareView:get_pane_layout()
+  local font = self:get_font()
+  local old_n = self.old_doc and #self.old_doc.lines or 0
+  local digits = math.max(old_n, #self.doc.lines, 99)
+  local gutter = font:get_width(tostring(digits)) + style.padding.x * 2
+  local half = math.floor(self.size.x / 2)
+  local text_w = self.size.x - half - gutter - style.scrollbar_size
+  return half, gutter, text_w
+end
+
+function CompareView:get_gutter_width()
+  local half, gutter = self:get_pane_layout()
+  return half + gutter
+end
+
+-- base (HEAD) version, reloaded whenever the repository changes
+function CompareView:load_base()
+  local rel = repo.root and rel_path(self.abs)
+  local old, binary = {}, false
+  if rel and self.status ~= "untracked" then
+    local text, code = git(repo.root, { "show", "HEAD:" .. rel })
+    if code == 0 and text then
+      binary = text:find("\0", 1, true) ~= nil
+      old = split_lines(text)
+    end
+  end
+  if binary then old = {} end
+  self.base_binary = binary
+  self.base = old
+  self.old_doc = snapshot_doc(self.abs, old)
+  local font, w = self:get_font(), 0
+  for _, l in ipairs(old) do w = math.max(w, font:get_width(l)) end
+  self.old_max_width = w
+  self.rows_cid = nil
   core.redraw = true
 end
 
-local function diff_for_file(abs)
-  local rel = rel_path(abs)
-  if not rel then return "" end
-  if repo.files[abs] == "untracked" then
-    local out = git(repo.root, { "diff", "--no-color", "--no-index", "--", "/dev/null", rel })
-    return out or ""
+-- aligns the document with the base; cheap enough to redo on every edit
+function CompareView:sync_rows()
+  if not self.base then return end
+  local cid = self.doc:get_change_id()
+  if self.rows_cid == cid and self.rows_base == self.base then return end
+  self.rows_cid, self.rows_base = cid, self.base
+  local new = self.read_only and {} or doc_lines(self.doc)
+  self.rows, self.hunk_starts = build_rows(self.base, new, diff_lines(self.base, new, cfg.max_diff_lines))
+  local line_row = {}
+  for i, row in ipairs(self.rows) do
+    if row.r then line_row[row.r] = i end
   end
-  local out, code = git(repo.root, { "diff", "--no-color", "HEAD", "--", rel })
-  if (not out or out == "") and code ~= 0 then
-    out = git(repo.root, { "diff", "--no-color", "--cached", "--", rel })
+  -- an empty document still has one (empty) line to put the caret on
+  if not self.read_only then
+    for k = #line_row + 1, #self.doc.lines do
+      self.rows[#self.rows + 1] = { r = k, kind = "same" }
+      line_row[k] = #self.rows
+    end
   end
-  return out or ""
+  self.line_row = line_row
+end
+
+function CompareView:update()
+  if self.base_rev ~= rev and not self.loading then
+    self.base_rev, self.loading = rev, true
+    core.add_thread(function()
+      core.try(self.load_base, self)
+      self.loading = false
+    end)
+  end
+  self:sync_rows()
+  CompareView.super.update(self)
+end
+
+-- row-based geometry: document lines are placed on their aligned rows
+function CompareView:row_of(line)
+  local r = self.line_row[line]
+  if r then return r end
+  local n = #self.line_row
+  return (n > 0 and self.line_row[n] or 0) + (line - n)
+end
+
+function CompareView:get_rows_top()
+  local _, oy = self:get_content_offset()
+  return oy + self:get_header_height() + style.padding.y
+end
+
+function CompareView:get_row_count()
+  return math.max(#self.rows, #self.doc.lines)
+end
+
+function CompareView:get_scrollable_size()
+  return self:get_header_height() + style.padding.y
+    + self:get_line_height() * (self:get_row_count() - 1) + self.size.y
+end
+
+function CompareView:get_line_screen_position(idx)
+  local half, gutter = self:get_pane_layout()
+  local x = self.position.x + half + gutter - self.scroll.x
+  return x, self:get_rows_top() + (self:row_of(idx) - 1) * self:get_line_height()
+end
+
+function CompareView:get_visible_rows()
+  local lh = self:get_line_height()
+  local top = self:get_rows_top()
+  local first = math.max(1, math.floor((self.position.y + self:get_header_height() - top) / lh) + 1)
+  local last = math.min(self:get_row_count(), math.floor((self.position.y + self.size.y - top) / lh) + 1)
+  return first, last
+end
+
+function CompareView:get_visible_line_range()
+  local first, last = self:get_visible_rows()
+  if #self.rows == 0 then
+    return math.min(first, #self.doc.lines), math.min(last, #self.doc.lines)
+  end
+  local minl, maxl
+  for i = first, last do
+    local row = self.rows[i]
+    if row and row.r then minl = minl or row.r; maxl = row.r end
+  end
+  return minl or 1, maxl or 1
+end
+
+function CompareView:row_at(y)
+  return math.floor((y - self:get_rows_top()) / self:get_line_height()) + 1
+end
+
+function CompareView:resolve_screen_position(x, y)
+  local row = self:row_at(y)
+  local line
+  if #self.rows == 0 then
+    line = row
+  else
+    row = common.clamp(row, 1, #self.rows)
+    for i = row, #self.rows do
+      if self.rows[i].r then line = self.rows[i].r; break end
+    end
+    if not line then
+      for i = row, 1, -1 do
+        if self.rows[i].r then line = self.rows[i].r; break end
+      end
+    end
+  end
+  line = common.clamp(line or #self.doc.lines, 1, #self.doc.lines)
+  local tx = self:get_line_screen_position(line)
+  return line, self:get_x_offset_col(line, x - tx)
+end
+
+function CompareView:get_row_y(line)
+  return self:get_header_height() + style.padding.y + (self:row_of(line) - 1) * self:get_line_height()
+end
+
+function CompareView:scroll_to_line(line, ignore_if_visible, instant)
+  local min, max = self:get_visible_line_range()
+  if ignore_if_visible and line > min and line < max then return end
+  self.scroll.to.y = math.max(0, self:get_row_y(line) - self.size.y / 2)
+  if instant then self.scroll.y = self.scroll.to.y end
+end
+
+function CompareView:scroll_to_make_visible(line, col)
+  local lh = self:get_line_height()
+  local ry = self:get_row_y(line)
+  self.scroll.to.y = math.min(self.scroll.to.y, ry - self:get_header_height() - lh)
+  self.scroll.to.y = math.max(self.scroll.to.y, ry + lh * 2 - self.size.y, 0)
+  local _, _, text_w = self:get_pane_layout()
+  local xoffset = self:get_col_x_offset(line, col)
+  self.scroll.to.x = math.max(0, xoffset - text_w + text_w / 5)
+end
+
+function CompareView:get_h_scroll_limit()
+  local _, _, text_w = self:get_pane_layout()
+  local w = math.max(self.old_max_width, self:get_max_line_width())
+  return math.max(0, w + self:get_font():get_width(" ") * 4 - text_w)
+end
+
+function CompareView:get_h_scrollbar_rect()
+  return 0, 0, 0, 0
+end
+
+-- only the working copy (right pane) takes the mouse for editing
+function CompareView:in_edit_area(x, y)
+  local half = self:get_pane_layout()
+  return not self.read_only and x >= self.position.x + half
+    and y >= self.position.y + self:get_header_height()
+end
+
+function CompareView:on_mouse_pressed(button, x, y, clicks)
+  if self:scrollbar_overlaps_point(x, y) or self:in_edit_area(x, y) then
+    return CompareView.super.on_mouse_pressed(self, button, x, y, clicks)
+  end
+  return true
+end
+
+function CompareView:on_mouse_moved(x, y, ...)
+  CompareView.super.on_mouse_moved(self, x, y, ...)
+  if not self:in_edit_area(x, y) then self.cursor = "arrow" end
+end
+
+function CompareView:goto_hunk(dir)
+  local starts = self.hunk_starts
+  if #starts == 0 then return end
+  local lh = self:get_line_height()
+  local cur = math.floor(self.scroll.to.y / lh) + 1 + 2
+  local target
+  if dir > 0 then
+    for _, r in ipairs(starts) do if r > cur then target = r; break end end
+    target = target or starts[1]
+  else
+    for k = #starts, 1, -1 do if starts[k] < cur then target = starts[k]; break end end
+    target = target or starts[#starts]
+  end
+  self.scroll.to.y = math.max(0, (target - 3) * lh)
+  -- put the caret on the change so typing edits it right away
+  local row = self.rows[target]
+  if row and row.r and not self.read_only then self.doc:set_selection(row.r, 1) end
+end
+
+local function tint(color, a) return { color[1], color[2], color[3], a } end
+
+function CompareView:draw_old_line(idx, x, y, w, gutter, lh, bg)
+  local font = self:get_font()
+  if bg then renderer.draw_rect(x, y, w, lh, bg) end
+  if not idx then return end
+  local ty = y + self:get_line_text_y_offset()
+  renderer.draw_text(font, tostring(idx), x + style.padding.x, ty, style.line_number)
+  core.push_clip_rect(x + gutter, y, w - gutter, lh)
+  local tx = x + gutter - self.scroll.x
+  for _, type, text in self.old_doc.highlighter:each_token(idx) do
+    tx = renderer.draw_text(font, text, tx, ty, style.syntax[type])
+  end
+  core.pop_clip_rect()
+end
+
+-- a hint centered inside one pane, so it never crosses the divider
+local function draw_pane_message(text, x, y, w, h)
+  core.push_clip_rect(x, y, w, h)
+  common.draw_text(style.sidebar_font or style.font, style.dim, text, "center", x, y, w, h)
+  core.pop_clip_rect()
+end
+
+function CompareView:draw()
+  self:sync_rows()
+  self:draw_background(style.background)
+  local px, py, sw = self.position.x, self.position.y, self.size.x
+  local hh = self:get_header_height()
+  local font = self:get_font()
+  font:set_tab_width(font:get_width(" ") * config.indent_size)
+  local half, gutter = self:get_pane_layout()
+  local rw = sw - half
+  local lh = self:get_line_height()
+  local c = colors()
+  local filler = style.background2
+  local top = self:get_rows_top()
+
+  core.push_clip_rect(px, py + hh, sw, self.size.y - hh)
+  if self.base then
+    local first, last = self:get_visible_rows()
+    local line1, _, line2 = self.doc:get_selection(true)
+    for i = first, math.min(last, #self.rows) do
+      local row = self.rows[i]
+      local y = top + (i - 1) * lh
+      local lbg, rbg
+      if row.kind == "mod" then
+        lbg, rbg = tint(c.modified, 38), tint(c.modified, 38)
+      elseif row.kind == "del" then
+        lbg = tint(c.deleted, 45)
+      elseif row.kind == "add" then
+        rbg = tint(c.added, 40)
+      end
+      if row.kind ~= "same" then
+        if not row.l then lbg = filler end
+        if not row.r then rbg = filler end
+      end
+      self:draw_old_line(row.l, px, y, half, gutter, lh, lbg)
+      if rbg then renderer.draw_rect(px + half, y, rw, lh, rbg) end
+      if row.r and not self.read_only then
+        local color = (row.r >= line1 and row.r <= line2) and style.line_number2 or style.line_number
+        renderer.draw_text(font, tostring(row.r), px + half + style.padding.x,
+          y + self:get_line_text_y_offset(), color)
+        core.push_clip_rect(px + half + gutter, y, rw - gutter, lh)
+        self:draw_line_body(row.r, px + half + gutter - self.scroll.x, y)
+        core.pop_clip_rect()
+      end
+    end
+
+    -- per-pane notes for sides that have nothing to show
+    local binary = self.file_binary or self.base_binary
+    local msg_y, msg_h = top, lh * 2
+    local left_msg = binary and "Binary file"
+      or ((self.status == "untracked" or self.status == "added") and "Not in HEAD (new file)")
+      or nil
+    local right_msg = binary and "Binary file"
+      or (self.status == "deleted" and "File deleted")
+      or (self.read_only and "Cannot be shown") or nil
+    if left_msg then draw_pane_message(left_msg, px, msg_y, half, msg_h) end
+    if right_msg then draw_pane_message(right_msg, px + half, msg_y, rw, msg_h) end
+  else
+    draw_pane_message("Loading...", px, top, half, lh * 2)
+    draw_pane_message("Loading...", px + half, top, rw, lh * 2)
+  end
+  core.pop_clip_rect()
+
+  -- center divider
+  renderer.draw_rect(px + half - style.divider_size, py, style.divider_size, self.size.y, style.divider)
+
+  -- header: what each side shows
+  renderer.draw_rect(px, py, sw, hh, style.background2)
+  renderer.draw_rect(px, py + hh - style.divider_size, sw, style.divider_size, style.divider)
+  local rel = rel_path(self.abs) or common.basename(self.abs)
+  local left = (self.status == "untracked" or self.status == "added") and "(new file)" or "HEAD"
+  local right = self.status == "deleted" and "(deleted)" or "Working copy"
+  local bold, regular = style.sidebar_tab_font or style.font, style.sidebar_font or style.font
+  core.push_clip_rect(px, py, half - style.padding.x, hh)
+  local x = common.draw_text(bold, style.accent, left, nil, px + style.padding.x, py, 0, hh)
+  common.draw_text(regular, style.dim, "  " .. rel, nil, x, py, 0, hh)
+  core.pop_clip_rect()
+  core.push_clip_rect(px + half, py, rw, hh)
+  x = common.draw_text(bold, style.accent, right, nil, px + half + style.padding.x, py, 0, hh)
+  local n = #self.hunk_starts
+  local info = n == 1 and "  1 change" or ("  " .. n .. " changes")
+  if not self.read_only then info = info .. "  ·  editable" end
+  common.draw_text(regular, style.dim, info, nil, x, py, 0, hh)
+  core.pop_clip_rect()
+
+  self:draw_scrollbar()
+end
+
+-- opens (or focuses) the compare view for `abs` in the editor area
+local function open_compare(abs, status)
+  for _, v in ipairs(core.root_view.root_node:get_children()) do
+    if v.is_git_diff_view and v.abs == abs then
+      v.status = status or v.status
+      local node = core.root_view.root_node:get_node_for_view(v)
+      node:set_active_view(v)
+      core.set_active_view(v)
+      return v
+    end
+  end
+  local node = core.root_view:get_active_node()
+  if node.locked and core.last_active_view then
+    core.set_active_view(core.last_active_view)
+    node = core.root_view:get_active_node()
+  end
+  local view = CompareView(abs, status or repo.files[abs] or "modified")
+  node:add_view(view)
+  core.root_view.root_node:update_layout()
+  core.redraw = true
+  return view
 end
 
 -- commands
@@ -497,8 +876,6 @@ local function in_repo_docview()
   return v and v:is(DocView) and not v.is_git_diff_view and v.doc.filename
     and repo.root and rel_path(doc_abs(v.doc)) ~= nil
 end
-
-local function in_repo() return repo.root ~= nil end
 
 local function current_hunk_index(st, line)
   for idx, h in ipairs(st.hunks) do
@@ -729,12 +1106,7 @@ end
 
 command.add(in_repo_docview, {
   ["git:diff-file"] = function()
-    local doc = core.active_view.doc
-    local abs, name = doc_abs(doc), doc:get_name()
-    core.add_thread(function()
-      local text = diff_for_file(abs)
-      open_diff("diff: " .. common.basename(name), text)
-    end)
+    open_compare(doc_abs(core.active_view.doc))
   end,
 
   ["git:stage-file"] = function()
@@ -799,41 +1171,187 @@ command.add(in_repo_docview, {
   end,
 })
 
-command.add(in_repo, {
-  ["git:diff-all"] = function()
-    core.add_thread(function()
-      local out, code = git(repo.root, { "diff", "--no-color", "HEAD" })
-      if (not out or out == "") and code ~= 0 then
-        out = git(repo.root, { "diff", "--no-color", "--cached" })
-      end
-      local extra = {}
-      for abs, st in pairs(repo.files) do
-        if st == "untracked" then extra[#extra + 1] = rel_path(abs) end
-      end
-      table.sort(extra)
-      out = out or ""
-      if #extra > 0 then
-        out = out .. "\n# Untracked files\n" .. table.concat(extra, "\n") .. "\n"
-      end
-      open_diff("diff: all changes", out)
-    end)
-  end,
+command.add(function() return core.active_view and core.active_view.is_git_diff_view end, {
+  ["git:compare-next-change"] = function() core.active_view:goto_hunk(1) end,
+  ["git:compare-previous-change"] = function() core.active_view:goto_hunk(-1) end,
 })
 
 command.add(function() return core.active_view and core.active_view.git_popup ~= nil end, {
   ["git:close-popup"] = function() close_popup(core.active_view) end,
 })
 
+-- sidebar "Git" tab: changed files grouped like IntelliJ's commit window
+local GROUPS = {
+  { id = "changes", name = "Changes",       statuses = { modified = true, conflict = true } },
+  { id = "new",     name = "New files",     statuses = { added = true, untracked = true } },
+  { id = "deleted", name = "Deleted files", statuses = { deleted = true } },
+}
+
+local git_panel = { id = "git", name = "Git", collapsed = {} }
+
+-- grouped, sorted file entries; rebuilt only when the status changes
+local function panel_groups()
+  if git_panel.cache_sig == repo.signature and git_panel.cache_root == repo.root then
+    return git_panel.cache
+  end
+  local groups = {}
+  for _, g in ipairs(GROUPS) do groups[#groups + 1] = { def = g, files = {} } end
+  for abs, st in pairs(repo.files) do
+    for _, g in ipairs(groups) do
+      if g.def.statuses[st] then
+        local rel = rel_path(abs) or abs
+        g.files[#g.files + 1] = {
+          abs = abs, rel = rel, status = st,
+          name = rel:match("[^/]+$"), dir = rel:match("^(.*)/[^/]+$"),
+        }
+      end
+    end
+  end
+  for _, g in ipairs(groups) do
+    table.sort(g.files, function(a, b) return a.rel < b.rel end)
+  end
+  git_panel.cache, git_panel.cache_sig, git_panel.cache_root = groups, repo.signature, repo.root
+  return groups
+end
+
+local STATUS_LETTER = { modified = "M", added = "A", untracked = "U", deleted = "D", conflict = "C" }
+
+function git_panel.draw(view, x, y, w)
+  local h = view:get_item_height()
+  local pad = style.padding.x
+  local font = style.sidebar_font
+  local c = colors()
+  git_panel.hits = {}
+  y = y + style.padding.y
+  if not repo.root then
+    local msg = core.project_dir and "Not a git repository" or "No folder open"
+    common.draw_text(font, style.dim, msg, nil, x + pad, y, 0, h)
+    return y + h
+  end
+
+  -- branch: label, then name with ahead/behind badges
+  view:draw_label("Branch", x + pad, y, h, style.dim)
+  y = y + h
+  local bx = common.draw_text(font, style.accent, repo.branch or "?", nil, x + pad, y, 0, h)
+  bx = bx + math.floor(6 * SCALE)
+  if repo.ahead > 0 then
+    bx = bx + view:draw_badge("↑" .. repo.ahead, bx, y, h, c.added) + math.floor(4 * SCALE)
+  end
+  if repo.behind > 0 then
+    view:draw_badge("↓" .. repo.behind, bx, y, h, c.modified)
+  end
+  y = y + h + style.padding.y
+  renderer.draw_rect(x + pad, y - math.floor(style.padding.y / 2), w - pad * 2,
+    style.divider_size, style.divider)
+
+  local active = core.active_view
+  local active_abs = active and active.is_git_diff_view and active.abs
+  local icon_w = style.icon_font:get_width("D")
+  local chevron_w = style.icon_font:get_width("+")
+  local guide_color = { style.dim[1], style.dim[2], style.dim[3], 110 }
+  local accent_bar = math.max(2, math.floor(2 * SCALE))
+  local label_w = 0
+  for _, l in pairs(STATUS_LETTER) do label_w = math.max(label_w, style.sidebar_label_font:get_width(l)) end
+  local any = false
+  for _, g in ipairs(panel_groups()) do
+    if #g.files > 0 then
+      any = true
+      local id = g.def.id
+      local hovered = git_panel.hovered == id
+      if hovered then renderer.draw_rect(x, y, w, h, style.line_highlight) end
+      local color = hovered and style.accent or style.text
+      local collapsed = git_panel.collapsed[id]
+      common.draw_text(style.icon_font, style.dim, collapsed and "+" or "-", nil, x + pad, y, 0, h)
+      view:draw_label(g.def.name, x + pad + chevron_w + math.floor(6 * SCALE), y, h, color)
+      view:draw_badge(tostring(#g.files), x + w - pad, y, h, style.text, true)
+      git_panel.hits[#git_panel.hits + 1] = { y = y, h = h, group = id }
+      y = y + h
+      if not collapsed then
+        local first_y = y
+        for _, f in ipairs(g.files) do
+          if f.abs == active_abs then
+            renderer.draw_rect(x, y, w, h, style.line_highlight)
+            renderer.draw_rect(x, y, accent_bar, h, style.caret)
+          elseif git_panel.hovered == f.abs then
+            renderer.draw_rect(x, y, w, h, style.line_highlight)
+          end
+          local fc = c[f.status] or c.modified
+          local right = x + w - pad
+          -- status letter on the right, like IntelliJ / VS Code
+          common.draw_text(style.sidebar_label_font, fc, STATUS_LETTER[f.status] or "?",
+            "center", right - label_w, y, label_w, h)
+          right = right - label_w - math.floor(8 * SCALE)
+          local tx = x + pad * 2
+          common.draw_text(style.icon_font, fc, "f", nil, tx, y, 0, h)
+          tx = tx + icon_w + font:get_width(" ")
+          core.push_clip_rect(tx, y, math.max(0, right - tx), h)
+          tx = common.draw_text(font, fc, f.name, nil, tx, y, 0, h)
+          if f.dir then
+            common.draw_text(font, style.dim, "  " .. f.dir, nil, tx, y, 0, h)
+          end
+          core.pop_clip_rect()
+          git_panel.hits[#git_panel.hits + 1] = { y = y, h = h, file = f }
+          y = y + h
+        end
+        -- guide tying the files to their group
+        local gx = x + pad + math.floor(chevron_w / 2)
+        renderer.draw_rect(gx, first_y, style.divider_size, y - first_y, guide_color)
+      end
+      y = y + math.floor(style.padding.y / 2)
+    end
+  end
+  if not any then
+    common.draw_text(font, style.dim, "No changes", nil, x + pad, y, 0, h)
+    y = y + h
+  end
+  return y
+end
+
+local function panel_hit(py)
+  for _, hit in ipairs(git_panel.hits or {}) do
+    if py >= hit.y and py < hit.y + hit.h then return hit end
+  end
+end
+
+function git_panel.on_mouse_moved(view, px, py)
+  local hit = panel_hit(py)
+  local id = hit and (hit.group or hit.file.abs)
+  if git_panel.hovered ~= id then git_panel.hovered = id; core.redraw = true end
+  view.cursor = hit and "hand" or "arrow"
+end
+
+function git_panel.on_mouse_pressed(view, button, px, py)
+  local hit = panel_hit(py)
+  if not hit or button ~= "left" then return end
+  if hit.group then
+    git_panel.collapsed[hit.group] = not git_panel.collapsed[hit.group]
+    core.redraw = true
+  else
+    open_compare(hit.file.abs, hit.file.status)
+  end
+end
+
+if ok_tv and type(tv) == "table" and tv.add_panel then
+  tv:add_panel(git_panel)
+end
+
 command.add(nil, {
   ["git:refresh"] = request_refresh,
+
+  ["git:show-changes"] = function()
+    if not (ok_tv and tv.set_panel) then return end
+    tv.visible = true
+    tv:set_panel("git")
+    request_refresh()
+  end,
 })
 
 keymap.add {
   ["escape"] = "git:close-popup",
   ["ctrl+alt+d"] = "git:diff-file",
-  ["ctrl+alt+shift+d"] = "git:diff-all",
-  ["ctrl+alt+."] = "git:next-hunk",
-  ["ctrl+alt+,"] = "git:previous-hunk",
+  ["ctrl+alt+shift+d"] = "git:show-changes",
+  ["ctrl+alt+."] = { "git:next-hunk", "git:compare-next-change" },
+  ["ctrl+alt+,"] = { "git:previous-hunk", "git:compare-previous-change" },
 }
 
 -- refresh right after saving

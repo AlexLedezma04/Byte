@@ -65,8 +65,29 @@ function Doc:reset_syntax()
 end
 
 
+-- marks the doc as one the editor can't show (binary, unreadable); it stays empty
+local function mark_unreadable(doc, filename, reason)
+  doc:reset()
+  doc.filename = filename
+  doc.unreadable = reason
+end
+
+
 function Doc:load(filename)
-  local fp = assert( io.open(filename, "rb") )
+  local fp, err = io.open(filename, "rb")
+  if not fp then
+    if system.get_file_info(filename) then
+      return mark_unreadable(self, filename, "The file could not be read.")
+    end
+    error(err)
+  end
+  local head = fp:read(8000) or ""
+  if head:find("\0", 1, true) then
+    fp:close()
+    return mark_unreadable(self, filename, true)
+  end
+  fp:seek("set")
+  self.unreadable = nil
   self:reset()
   self.filename = filename
   self.lines = {}
@@ -87,6 +108,10 @@ end
 
 
 function Doc:save(filename)
+  -- never overwrite a file whose contents were not loaded
+  if self.unreadable and (filename == nil or filename == self.filename) then
+    error("Can't save " .. self.filename .. ": it was not opened as text")
+  end
   filename = filename or assert(self.filename, "no filename set to default to")
   local fp = assert( io.open(filename, "wb") )
   for _, line in ipairs(self.lines) do

@@ -6,6 +6,7 @@ local command = require "core.command"
 local Object = require "core.object"
 local View = require "core.view"
 local DocView = require "core.docview"
+local logo = require "core.logo"
 
 
 local EmptyView = View:extend()
@@ -23,7 +24,7 @@ local HINTS_FOLDER = {
   { "search the folder", "project-search:find" },
   { "create a new file", "core:new-doc" },
   { "open a terminal", "terminal:swap-drawer" },
-  { "show Git changes", "git:diff-all" },
+  { "show Git changes", "git:show-changes" },
   { "close the folder", "core:close-folder" },
 }
 
@@ -45,7 +46,8 @@ local function draw_text(x, y, color)
   local big = style.big_font:get_height()
   local hints_h = #lines * th + (#lines - 1) * style.padding.y
   local dh = math.max(big, hints_h) + style.padding.y * 2
-  x = renderer.draw_text(style.big_font, "Byte", x, y + (dh - big) / 2, color)
+  local mark_h = math.min(dh, math.floor(big * 1.6))
+  x = x + logo.draw(x, y + math.floor((dh - mark_h) / 2), mark_h, color)
   x = x + style.padding.x
   renderer.draw_rect(x, y, math.ceil(1 * SCALE), dh, color)
   y = y + (dh - hints_h) / 2
@@ -63,6 +65,41 @@ function EmptyView:draw()
   local x = self.position.x + math.max(style.padding.x, (self.size.x - w) / 2)
   local y = self.position.y + (self.size.y - h) / 2
   draw_text(x, y, style.dim)
+end
+
+
+
+-- placeholder tab for files the editor can't show
+local UnreadableView = View:extend()
+
+function UnreadableView:new(doc)
+  UnreadableView.super.new(self)
+  self.doc = doc
+end
+
+function UnreadableView:get_name()
+  return (self.doc:get_name():match("[^/%\\]*$"))
+end
+
+-- callers that jump to a position after opening a doc
+function UnreadableView:scroll_to_line() end
+
+function UnreadableView:draw()
+  self:draw_background(style.background)
+  local font = style.sidebar_font or style.font
+  local th = style.big_font:get_height()
+  local lh = font:get_height()
+  local gap = style.padding.y
+  local reason = type(self.doc.unreadable) == "string" and self.doc.unreadable
+  local h = th + gap + lh + (reason and lh + gap or 0)
+  local x, y, w = self.position.x, self.position.y + (self.size.y - h) / 2, self.size.x
+  core.push_clip_rect(self.position.x, self.position.y, self.size.x, self.size.y)
+  common.draw_text(style.big_font, style.dim, "Can't open this file", "center", x, y, w, th)
+  y = y + th + gap
+  common.draw_text(font, style.text, self.doc:get_name(), "center", x, y, w, lh)
+  y = y + lh + gap
+  if reason then common.draw_text(font, style.dim, reason, "center", x, y, w, lh) end
+  core.pop_clip_rect()
 end
 
 
@@ -474,7 +511,7 @@ function RootView:open_doc(doc)
       return view
     end
   end
-  local view = DocView(doc)
+  local view = doc.unreadable and UnreadableView(doc) or DocView(doc)
   node:add_view(view)
   self.root_node:update_layout()
   view:scroll_to_line(view.doc:get_selection(), true, true)
