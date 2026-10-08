@@ -7,6 +7,68 @@ local LogView = require "core.logview"
 
 local fullscreen = false
 
+
+-- folder picker typed into the command view, suggesting only folders
+local function pick_folder_with_command_view()
+  core.command_view:enter("Open Folder", function(text)
+    text = text:gsub("^~", os.getenv("HOME") or "~")
+    core.open_folder(text)
+  end, function(text)
+    text = text:gsub("^~", os.getenv("HOME") or "~")
+    local res = {}
+    for _, path in ipairs(common.path_suggest(text)) do
+      if path:sub(-1) == PATHSEP then table.insert(res, path) end
+    end
+    return res
+  end)
+  local start = core.project_dir or os.getenv("HOME") or ""
+  core.command_view:set_text(start .. PATHSEP)
+end
+
+
+local dialog_tool
+local function find_dialog_tool()
+  if dialog_tool == nil then
+    dialog_tool = false
+    if PATHSEP == "/" then
+      for _, tool in ipairs({ "zenity", "kdialog" }) do
+        local fp = io.popen("command -v " .. tool .. " 2>/dev/null")
+        local found = fp and fp:read("*l")
+        if fp then fp:close() end
+        if found and found ~= "" then dialog_tool = tool; break end
+      end
+    end
+  end
+  return dialog_tool
+end
+
+local shell_quote = common.shell_quote
+
+local function pick_folder_with_dialog()
+  local tool = find_dialog_tool()
+  if not tool then return false end
+  local start = (core.project_dir or os.getenv("HOME") or "/") .. "/"
+  local cmd
+  if tool == "zenity" then
+    cmd = "zenity --file-selection --directory --title='Open Folder - Byte' --filename=" .. shell_quote(start)
+  else
+    cmd = "kdialog --title 'Open Folder - Byte' --getexistingdirectory " .. shell_quote(start)
+  end
+  local out = os.tmpname()
+  local done = out .. ".done"
+  system.exec("(" .. cmd .. " > " .. shell_quote(out) .. " 2>/dev/null; touch " .. shell_quote(done) .. ")")
+  core.add_thread(function()
+    while not system.get_file_info(done) do coroutine.yield(0.1) end
+    local fp = io.open(out, "r")
+    local path = fp and fp:read("*l")
+    if fp then fp:close() end
+    os.remove(out)
+    os.remove(done)
+    if path and path ~= "" then core.open_folder(path) end
+  end)
+  return true
+end
+
 command.add(nil, {
   ["core:quit"] = function()
     core.quit()
@@ -88,8 +150,18 @@ command.add(nil, {
     core.root_view:open_doc(core.open_doc(EXEDIR .. "/data/user/init.lua"))
   end,
 
+  ["core:open-folder"] = function()
+    if not pick_folder_with_dialog() then pick_folder_with_command_view() end
+  end,
+
+  ["core:open-folder-by-path"] = pick_folder_with_command_view,
+
+  ["core:close-folder"] = function()
+    core.close_folder()
+  end,
+
   ["core:open-project-module"] = function()
-    local filename = ".lite_project.lua"
+    local filename = ".byte_project.lua"
     if system.get_file_info(filename) then
       core.root_view:open_doc(core.open_doc(filename))
     else

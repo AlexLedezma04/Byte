@@ -87,6 +87,8 @@ keymap.add {
   ["ctrl+shift+p"] = "core:find-command",
   ["ctrl+p"] = "core:find-file",
   ["ctrl+o"] = "core:open-file",
+  ["ctrl+shift+o"] = "core:open-folder",
+  ["ctrl+alt+w"] = "core:close-folder",
   ["ctrl+n"] = "core:new-doc",
   ["alt+return"] = "core:toggle-fullscreen",
 

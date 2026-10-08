@@ -2,6 +2,7 @@ local core = require "core"
 local common = require "core.common"
 local style = require "core.style"
 local keymap = require "core.keymap"
+local command = require "core.command"
 local Object = require "core.object"
 local View = require "core.view"
 local DocView = require "core.docview"
@@ -9,21 +10,47 @@ local DocView = require "core.docview"
 
 local EmptyView = View:extend()
 
+local HINTS_NO_FOLDER = {
+  { "run a command", "core:find-command" },
+  { "open a folder", "core:open-folder" },
+  { "open a file", "core:open-file" },
+  { "create a new file", "core:new-doc" },
+  { "open a terminal", "terminal:swap-drawer" },
+}
+local HINTS_FOLDER = {
+  { "run a command", "core:find-command" },
+  { "open a file from the folder", "core:find-file" },
+  { "search the folder", "project-search:find" },
+  { "create a new file", "core:new-doc" },
+  { "open a terminal", "terminal:swap-drawer" },
+  { "show Git changes", "git:diff-all" },
+  { "close the folder", "core:close-folder" },
+}
+
+local function get_hints()
+  local lines = {}
+  for _, hint in ipairs(core.project_dir and HINTS_FOLDER or HINTS_NO_FOLDER) do
+    local binding = keymap.get_binding(hint[2])
+    local cmd = command.map[hint[2]]
+    if binding and cmd and cmd.predicate() then
+      table.insert(lines, binding .. " to " .. hint[1])
+    end
+  end
+  return lines
+end
+
 local function draw_text(x, y, color)
-  local th = style.big_font:get_height()
-  local dh = th + style.padding.y * 2
-  x = renderer.draw_text(style.big_font, "lite", x, y + (dh - th) / 2, color)
+  local lines = get_hints()
+  local th = style.font:get_height()
+  local big = style.big_font:get_height()
+  local hints_h = #lines * th + (#lines - 1) * style.padding.y
+  local dh = math.max(big, hints_h) + style.padding.y * 2
+  x = renderer.draw_text(style.big_font, "Byte", x, y + (dh - big) / 2, color)
   x = x + style.padding.x
   renderer.draw_rect(x, y, math.ceil(1 * SCALE), dh, color)
-  local lines = {
-    { fmt = "%s to run a command", cmd = "core:find-command" },
-    { fmt = "%s to open a file from the project", cmd = "core:find-file" },
-  }
-  th = style.font:get_height()
-  y = y + (dh - th * 2 - style.padding.y) / 2
+  y = y + (dh - hints_h) / 2
   local w = 0
-  for _, line in ipairs(lines) do
-    local text = string.format(line.fmt, keymap.get_binding(line.cmd))
+  for _, text in ipairs(lines) do
     w = math.max(w, renderer.draw_text(style.font, text, x + style.padding.x, y, color))
     y = y + th + style.padding.y
   end
@@ -62,6 +89,7 @@ end
 
 function Node:on_mouse_moved(x, y, ...)
   self.hovered_tab = self:get_tab_overlapping_point(x, y)
+  self.hovered_close = self.hovered_tab and self:tab_close_overlapping_point(self.hovered_tab, x, y)
   if self.type == "leaf" then
     self.active_view:on_mouse_moved(x, y, ...)
   else
@@ -191,13 +219,24 @@ function Node:get_children(t)
 end
 
 
+function Node:get_divider_drag_target()
+  for _, child in ipairs({ self.a, self.b }) do
+    if child:get_locked_size() then
+      local view = child.type == "leaf" and child.active_view
+      return view and view.on_divider_dragged and view or false
+    end
+  end
+  return true
+end
+
+
 function Node:get_divider_overlapping_point(px, py)
   if self.type ~= "leaf" then
     local p = 6
     local x, y, w, h = self:get_divider_rect()
     x, y = x - p, y - p
     w, h = w + p * 2, h + p * 2
-    if px > x and py > y and px < x + w and py < y + h then
+    if px > x and py > y and px < x + w and py < y + h and self:get_divider_drag_target() then
       return self
     end
     return self.a:get_divider_overlapping_point(px, py)
@@ -206,8 +245,15 @@ function Node:get_divider_overlapping_point(px, py)
 end
 
 
+-- documents always get a tab bar
+function Node:has_tabs()
+  if self.type ~= "leaf" or self.locked then return false end
+  return #self.views > 1 or (self.views[1] ~= nil and not self.views[1]:is(EmptyView))
+end
+
+
 function Node:get_tab_overlapping_point(px, py)
-  if #self.views == 1 then return nil end
+  if not self:has_tabs() then return nil end
   local x, y, w, h = self:get_tab_rect(1)
   if px >= x and py >= y and px < x + w * #self.views and py < y + h then
     return math.floor((px - x) / w) + 1
@@ -232,6 +278,18 @@ function Node:get_tab_rect(idx)
   local tw = math.min(style.tab_width, math.ceil(self.size.x / #self.views))
   local h = style.font:get_height() + style.padding.y * 2
   return self.position.x + (idx-1) * tw, self.position.y, tw, h
+end
+
+
+function Node:get_tab_close_rect(idx)
+  local x, y, w, h = self:get_tab_rect(idx)
+  local size = style.font:get_height()
+  return x + w - size - style.padding.x / 2, y + (h - size) / 2, size, size
+end
+
+
+function Node:tab_close_overlapping_point(idx, px, py)
+  return common.point_in_rect(px, py, self:get_tab_close_rect(idx))
 end
 
 
@@ -295,7 +353,7 @@ end
 function Node:update_layout()
   if self.type == "leaf" then
     local av = self.active_view
-    if #self.views > 1 then
+    if self:has_tabs() then
       local _, _, _, th = self:get_tab_rect(1)
       av.position.x, av.position.y = self.position.x, self.position.y + th
       av.size.x, av.size.y = self.size.x, self.size.y - th
@@ -348,8 +406,14 @@ function Node:draw_tabs()
     if i == self.hovered_tab then
       color = style.text
     end
-    core.push_clip_rect(x, y, w, h)
-    x, w = x + style.padding.x, w - style.padding.x * 2
+    local cx, cy, cw, ch = self:get_tab_close_rect(i)
+    if view == self.active_view or i == self.hovered_tab then
+      local hovered = i == self.hovered_tab and self.hovered_close
+      if hovered then renderer.draw_rect(cx, cy, cw, ch, style.line_highlight) end
+      common.draw_text(style.font, hovered and style.accent or style.dim, "×", "center", cx, cy, cw, ch)
+    end
+    core.push_clip_rect(x, y, cx - x, h)
+    x, w = x + style.padding.x, cx - x - style.padding.x
     local align = style.font:get_width(text) > w and "left" or "center"
     common.draw_text(style.font, color, text, align, x, y, w, h)
     core.pop_clip_rect()
@@ -361,7 +425,7 @@ end
 
 function Node:draw()
   if self.type == "leaf" then
-    if #self.views > 1 then
+    if self:has_tabs() then
       self:draw_tabs()
     end
     local pos, size = self.active_view.position, self.active_view.size
@@ -428,7 +492,8 @@ function RootView:on_mouse_pressed(button, x, y, clicks)
   local idx = node:get_tab_overlapping_point(x, y)
   if idx then
     node:set_active_view(node.views[idx])
-    if button == "middle" then
+    if button == "middle"
+    or (button == "left" and node:tab_close_overlapping_point(idx, x, y)) then
       node:close_active_view(self.root_node)
     end
   else
@@ -449,6 +514,12 @@ end
 function RootView:on_mouse_moved(x, y, dx, dy)
   if self.dragged_divider then
     local node = self.dragged_divider
+    local target = node:get_divider_drag_target()
+    if target ~= true then
+      local d = node.type == "hsplit" and dx or dy
+      target:on_divider_dragged(node.b.active_view == target and -d or d)
+      return
+    end
     if node.type == "hsplit" then
       node.divider = node.divider + dx / node.size.x
     else

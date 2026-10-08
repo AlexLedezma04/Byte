@@ -11,6 +11,10 @@ local Doc
 
 local core = {}
 
+core.project_dir = nil
+
+local project_generation = 0
+
 
 local function project_scan_thread()
   local function diff_files(a, b)
@@ -29,6 +33,7 @@ local function project_scan_thread()
 
   local function get_files(path, t)
     coroutine.yield()
+    if t and t.generation ~= project_generation then return t end
     t = t or {}
     local size_limit = config.file_size_limit * 10e5
     local all = system.list_dir(path) or {}
@@ -60,17 +65,112 @@ local function project_scan_thread()
   end
 
   while true do
-    -- get project files and replace previous table if the new table is
-    -- different
-    local t = get_files(".")
-    if diff_files(core.project_files, t) then
-      core.project_files = t
-      core.redraw = true
+    if core.project_dir then
+      local generation = project_generation
+      local t = get_files(".", { generation = generation })
+      t.generation = nil
+      if generation == project_generation and diff_files(core.project_files, t) then
+        core.project_files = t
+        core.redraw = true
+      end
     end
 
-    -- wait for next scan
-    coroutine.yield(config.project_scan_rate)
+    local generation, waited = project_generation, 0
+    while waited < config.project_scan_rate and generation == project_generation do
+      coroutine.yield(0.1)
+      waited = waited + 0.1
+    end
   end
+end
+
+
+-- folder handling
+local function home_dir()
+  return os.getenv("HOME") or os.getenv("USERPROFILE") or "/"
+end
+
+function core.get_config_dir()
+  local base = os.getenv("XDG_CONFIG_HOME")
+  if PATHSEP == "\\" then
+    base = os.getenv("APPDATA") or home_dir()
+  elseif not base or base == "" then
+    base = home_dir() .. "/.config"
+  end
+  return base .. PATHSEP .. "byte"
+end
+
+local function session_file()
+  return core.get_config_dir() .. PATHSEP .. "session"
+end
+
+local function save_session()
+  local dir = core.get_config_dir()
+  if not system.get_file_info(dir) then
+    if PATHSEP == "\\" then
+      os.execute('mkdir "' .. dir .. '"')
+    else
+      os.execute("mkdir -p '" .. dir:gsub("'", "'\\''") .. "'")
+    end
+  end
+  local fp = io.open(session_file(), "w")
+  if fp then
+    fp:write(core.project_dir or "", "\n")
+    fp:close()
+  end
+end
+
+local function load_session()
+  local fp = io.open(session_file(), "r")
+  if not fp then return nil end
+  local dir = fp:read("*l")
+  fp:close()
+  if dir and dir ~= "" then
+    local info = system.get_file_info(dir)
+    if info and info.type == "dir" then return dir end
+  end
+end
+
+-- open docs keep working after the working directory changes
+local function make_doc_paths_absolute()
+  for _, doc in ipairs(core.docs) do
+    if doc.filename then
+      doc.filename = system.absolute_path(doc.filename) or doc.filename
+    end
+  end
+end
+
+local function folder_changed()
+  project_generation = project_generation + 1
+  core.project_files = {}
+  core.redraw = true
+end
+
+-- opens `path` as the project folder; returns true on success
+function core.open_folder(path)
+  local info = path and system.get_file_info(path)
+  if not info or info.type ~= "dir" then
+    core.error("Not a folder: %s", tostring(path))
+    return false
+  end
+  local abs = system.absolute_path(path)
+  make_doc_paths_absolute()
+  system.chdir(abs)
+  core.project_dir = abs
+  folder_changed()
+  save_session()
+  core.load_project_module()
+  core.log_quiet("Opened folder %s", abs)
+  return true
+end
+
+-- closes the project folder; the next start opens no folder
+function core.close_folder()
+  if not core.project_dir then return end
+  make_doc_paths_absolute()
+  system.chdir(home_dir())
+  core.project_dir = nil
+  folder_changed()
+  save_session()
 end
 
 
@@ -82,18 +182,24 @@ function core.init()
   CommandView = require "core.commandview"
   Doc = require "core.doc"
 
-  local project_dir = EXEDIR
+  -- a folder given on the command line, else the folder open at last exit
+  local project_dir
   local files = {}
   for i = 2, #ARGS do
     local info = system.get_file_info(ARGS[i]) or {}
     if info.type == "file" then
       table.insert(files, system.absolute_path(ARGS[i]))
     elseif info.type == "dir" then
-      project_dir = ARGS[i]
+      project_dir = system.absolute_path(ARGS[i])
     end
   end
-
-  system.chdir(project_dir)
+  project_dir = project_dir or load_session()
+  if project_dir then
+    system.chdir(project_dir)
+    core.project_dir = project_dir
+  else
+    system.chdir(home_dir())
+  end
 
   core.frame_start = 0
   core.clip_rect_stack = {{ 0,0,0,0 }}
@@ -115,6 +221,7 @@ function core.init()
   local got_plugin_error = not core.load_plugins()
   local got_user_error = not core.try(require, "user")
   local got_project_error = not core.load_project_module()
+  if core.project_dir then save_session() end
 
   for _, filename in ipairs(files) do
     core.root_view:open_doc(core.open_doc(filename))
@@ -127,7 +234,7 @@ end
 
 
 local temp_uid = (system.get_time() * 1000) % 0xffffffff
-local temp_file_prefix = string.format(".lite_temp_%08x", temp_uid)
+local temp_file_prefix = string.format(".byte_temp_%08x", temp_uid)
 local temp_file_counter = 0
 
 local function delete_temp_files()
@@ -189,7 +296,8 @@ end
 
 
 function core.load_project_module()
-  local filename = ".lite_project.lua"
+  if not core.project_dir then return true end
+  local filename = ".byte_project.lua"
   if system.get_file_info(filename) then
     return core.try(function()
       local fn, err = loadfile(filename)
@@ -400,7 +508,13 @@ function core.step()
 
   -- update window title
   local name = core.active_view:get_name()
-  local title = (name ~= "---") and (name .. " - lite") or  "lite"
+  local folder = core.project_dir and common.basename(core.project_dir)
+  local title = "Byte"
+  if name ~= "---" then
+    title = name .. (folder and (" - " .. folder) or "") .. " - Byte"
+  elseif folder then
+    title = folder .. " - Byte"
+  end
   if title ~= core.window_title then
     system.set_window_title(title)
     core.window_title = title
