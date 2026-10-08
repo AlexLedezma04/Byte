@@ -13,6 +13,9 @@ style.fallback_fonts = {
   "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
   "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
   "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+  "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+  "/usr/share/fonts/google-droid-sans-fonts/DroidSansFallbackFull.ttf",
+  "/usr/share/fonts/droid/DroidSansFallbackFull.ttf",
   "C:/Windows/Fonts/consola.ttf",
   "C:/Windows/Fonts/seguisym.ttf",
 }
