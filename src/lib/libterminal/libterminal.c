@@ -36,9 +36,9 @@
 #include <math.h>
 #include <sys/stat.h>
 
-#include "../lua52/lua.h"
-#include "../lua52/lauxlib.h"
-#include "../lua52/lualib.h"
+#include "../lua/lua.h"
+#include "../lua/lauxlib.h"
+#include "../lua/lualib.h"
 
 #ifndef min
   static int min(int a, int b) { return a < b ? a : b; }
@@ -1309,10 +1309,10 @@ static int f_terminal_lines(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
   int start = -terminal->scrollback_position;
   if (lua_gettop(L) >= 2)
-    start = luaL_checkinteger(L, 2);
+    start = (int) luaL_checknumber(L, 2);
   int end = start + terminal->lines;
   if (lua_gettop(L) >= 3)
-    end = luaL_checkinteger(L, 3) + 1;
+    end = (int) luaL_checknumber(L, 3) + 1;
   lua_newtable(L);
 
   int total_lines = 0;
@@ -1389,9 +1389,9 @@ static const char* lua_toutf8(lua_State* L, LPCWSTR str) {
 #endif
 
 static int f_terminal_new(lua_State* L) {
-  int x = luaL_checkinteger(L, 1);
-  int y = luaL_checkinteger(L, 2);
-  int scrollback_limit = luaL_checkinteger(L, 3);
+  int x = (int) luaL_checknumber(L, 1);
+  int y = (int) luaL_checknumber(L, 2);
+  int scrollback_limit = (int) luaL_checknumber(L, 3);
   const char* term_env = luaL_checkstring(L, 4);
   const char* path = luaL_checkstring(L, 5);
   char* arguments[256] = {0};
@@ -1509,7 +1509,7 @@ static int f_terminal_input(lua_State* L) {
 static int f_terminal_size(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
   if (lua_gettop(L) > 1) {
-    int x = luaL_checkinteger(L, 2), y = luaL_checkinteger(L, 3);
+    int x = (int) luaL_checknumber(L, 2), y = (int) luaL_checknumber(L, 3);
     terminal_resize(terminal, x, y);
   }
   lua_pushinteger(L, terminal->columns);
@@ -1572,7 +1572,7 @@ static int f_terminal_scrollback(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
   if (terminal->current_view == VIEW_NORMAL_BUFFER) {
     if (lua_gettop(L) >= 2)
-      terminal_scrollback(terminal, luaL_checkinteger(L, 2));
+      terminal_scrollback(terminal, (int) luaL_checknumber(L, 2));
     lua_pushinteger(L, terminal->scrollback_position);
     lua_pushinteger(L, terminal->scrollback_total_lines);
   } else {

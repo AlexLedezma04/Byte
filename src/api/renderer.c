@@ -31,8 +31,8 @@ static int f_show_debug(lua_State *L) {
 static int f_get_size(lua_State *L) {
   int w, h;
   ren_get_size(&w, &h);
-  lua_pushnumber(L, w);
-  lua_pushnumber(L, h);
+  lua_pushinteger(L, w);
+  lua_pushinteger(L, h);
   return 2;
 }
 
@@ -79,7 +79,7 @@ static int f_draw_text(lua_State *L) {
   int y = luaL_checknumber(L, 4);
   RenColor color = checkcolor(L, 5, 255);
   x = rencache_draw_text(*font, text, x, y, color);
-  lua_pushnumber(L, x);
+  lua_pushinteger(L, x);
   return 1;
 }
 

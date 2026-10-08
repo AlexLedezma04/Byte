@@ -70,7 +70,8 @@ function Doc:load(filename)
   self:reset()
   self.filename = filename
   self.lines = {}
-  for line in fp:lines() do
+  for l in fp:lines() do
+    local line = l
     if line:byte(-1) == 13 then
       line = line:sub(1, -2)
       self.crlf = true

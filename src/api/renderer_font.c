@@ -49,14 +49,14 @@ static int f_gc(lua_State *L) {
 static int f_get_width(lua_State *L) {
   RenFont **self = luaL_checkudata(L, 1, API_TYPE_FONT);
   const char *text = luaL_checkstring(L, 2);
-  lua_pushnumber(L, ren_get_font_width(*self, text) );
+  lua_pushinteger(L, ren_get_font_width(*self, text) );
   return 1;
 }
 
 
 static int f_get_height(lua_State *L) {
   RenFont **self = luaL_checkudata(L, 1, API_TYPE_FONT);
-  lua_pushnumber(L, ren_get_font_height(*self) );
+  lua_pushinteger(L, ren_get_font_height(*self) );
   return 1;
 }
 

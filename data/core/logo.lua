@@ -77,8 +77,8 @@ local function arc_points(x1, y1, r, large, sweep, x2, y2, out)
   if large == sweep then f = -f end
   local cx = (x1 + x2) / 2 + f * dy
   local cy = (y1 + y2) / 2 - f * dx
-  local a1 = math.atan2(y1 - cy, x1 - cx)
-  local a2 = math.atan2(y2 - cy, x2 - cx)
+  local a1 = math.atan(y1 - cy, x1 - cx)
+  local a2 = math.atan(y2 - cy, x2 - cx)
   local delta = a2 - a1
   if sweep == 1 and delta < 0 then delta = delta + 2 * math.pi end
   if sweep == 0 and delta > 0 then delta = delta - 2 * math.pi end
