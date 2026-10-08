@@ -125,7 +125,7 @@ retry:
     stbtt_ScaleForMappingEmToPixels(&font->stbfont, 1) /
     stbtt_ScaleForPixelHeight(&font->stbfont, 1);
   int res = stbtt_BakeFontBitmap(
-    font->data, 0, font->size * s, (void*) set->image->pixels,
+    font->data, stbtt_GetFontOffsetForIndex(font->data, 0), font->size * s, (void*) set->image->pixels,
     width, height, idx * 256, 256, set->glyphs);
 
   /* retry with a larger image buffer if the buffer wasn't large enough */
@@ -211,7 +211,9 @@ RenFont* ren_load_font(const char *filename, float size) {
   fp = NULL;
 
   /* init stbfont */
-  int ok = stbtt_InitFont(&font->stbfont, font->data, 0);
+  /* offset of the first font, so .ttc collections load too */
+  int ok = stbtt_InitFont(&font->stbfont, font->data,
+    stbtt_GetFontOffsetForIndex(font->data, 0));
   if (!ok) { goto fail; }
 
   /* get height and scale */

@@ -1,0 +1,28 @@
+# builds Byte.app (universal: Apple Silicon + Intel) and uploads
+# byte-macos.zip; run it from the Actions tab, or push a v* tag
+name: macos
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags, for the version in Info.plist
+      - run: brew install pkg-config
+      - uses: actions/cache@v4
+        with:
+          path: build/deps
+          key: sdl3-macos-${{ hashFiles('scripts/build_sdl.sh') }}
+      - run: |
+          [ -d build/deps/sdl3 ] || scripts/build_sdl.sh
+      - run: scripts/build_mac_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: byte-macos
+          path: build/byte-macos.zip

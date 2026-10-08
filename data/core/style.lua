@@ -18,6 +18,9 @@ style.fallback_fonts = {
   "/usr/share/fonts/droid/DroidSansFallbackFull.ttf",
   "C:/Windows/Fonts/consola.ttf",
   "C:/Windows/Fonts/seguisym.ttf",
+  "/System/Library/Fonts/Menlo.ttc",
+  "/System/Library/Fonts/Apple Symbols.ttf",
+  "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
 }
 
 local fallback_chains = {}

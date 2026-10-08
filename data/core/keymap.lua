@@ -14,6 +14,14 @@ local modkey_map = {
   ["right alt"]   = "altgr",
 }
 
+if PLATFORM == "macOS" then
+  for _, side in ipairs { "left", "right" } do
+    modkey_map[side .. " gui"]     = "ctrl"
+    modkey_map[side .. " command"] = "ctrl"
+    modkey_map[side .. " option"]  = side == "left" and "alt" or "altgr"
+  end
+end
+
 local modkeys = { "ctrl", "alt", "altgr", "shift" }
 
 local function key_to_stroke(k)
