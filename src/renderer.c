@@ -5,7 +5,8 @@
 #include "lib/stb/stb_truetype.h"
 #include "renderer.h"
 
-#define MAX_GLYPHSET 256
+#define MAX_GLYPHSET (0x110000 >> 8)
+#define REPLACEMENT_CHAR 0xFFFD
 
 struct RenImage {
   RenColor *pixels;
@@ -15,6 +16,7 @@ struct RenImage {
 typedef struct {
   RenImage *image;
   stbtt_bakedchar glyphs[256];
+  uint8_t missing[256];
 } GlyphSet;
 
 struct RenFont {
@@ -23,6 +25,9 @@ struct RenFont {
   GlyphSet *sets[MAX_GLYPHSET];
   float size;
   int height;
+  int ascent;
+  int mono_advance;
+  RenFont *fallback;
 };
 
 
@@ -138,6 +143,8 @@ retry:
   for (int i = 0; i < 256; i++) {
     set->glyphs[i].yoff += scaled_ascent;
     set->glyphs[i].xadvance = floor(set->glyphs[i].xadvance);
+    int codepoint = idx * 256 + i;
+    set->missing[i] = codepoint >= 32 && !stbtt_FindGlyphIndex(&font->stbfont, codepoint);
   }
 
   /* convert 8bit data to 32bit */
@@ -150,12 +157,36 @@ retry:
 }
 
 
-static GlyphSet* get_glyphset(RenFont *font, int codepoint) {
-  int idx = (codepoint >> 8) % MAX_GLYPHSET;
+static GlyphSet* get_glyphset(RenFont *font, unsigned codepoint) {
+  int idx = codepoint >> 8;
   if (!font->sets[idx]) {
     font->sets[idx] = load_glyphset(font, idx);
   }
   return font->sets[idx];
+}
+
+
+static stbtt_bakedchar* get_glyph(RenFont *font, unsigned codepoint, RenFont **owner, GlyphSet **out_set) {
+  if (codepoint >= 0x110000) { codepoint = REPLACEMENT_CHAR; }
+  RenFont *f = font;
+  for (int depth = 0; f && depth < 8; f = f->fallback, depth++) {
+    GlyphSet *set = get_glyphset(f, codepoint);
+    if (!set->missing[codepoint & 0xff]) {
+      *owner = f;
+      *out_set = set;
+      return &set->glyphs[codepoint & 0xff];
+    }
+  }
+  GlyphSet *set = get_glyphset(font, codepoint);
+  *owner = font;
+  *out_set = set;
+  return &set->glyphs[codepoint & 0xff];
+}
+
+
+static int glyph_advance(RenFont *font, RenFont *owner, stbtt_bakedchar *g) {
+  if (owner != font && font->mono_advance) { return font->mono_advance; }
+  return g->xadvance;
 }
 
 
@@ -187,11 +218,17 @@ RenFont* ren_load_font(const char *filename, float size) {
   stbtt_GetFontVMetrics(&font->stbfont, &ascent, &descent, &linegap);
   float scale = stbtt_ScaleForMappingEmToPixels(&font->stbfont, size);
   font->height = (ascent - descent + linegap) * scale + 0.5;
+  font->ascent = ascent * scale + 0.5;
 
   /* make tab and newline glyphs invisible */
   stbtt_bakedchar *g = get_glyphset(font, '\n')->glyphs;
   g['\t'].x1 = g['\t'].x0;
   g['\n'].x1 = g['\n'].x0;
+
+  /* monospaced if narrow and wide letters advance the same */
+  if (g['i'].xadvance == g['M'].xadvance && g['M'].xadvance == g['W'].xadvance) {
+    font->mono_advance = g['M'].xadvance;
+  }
 
   return font;
 
@@ -216,6 +253,15 @@ void ren_free_font(RenFont *font) {
 }
 
 
+void ren_set_font_fallback(RenFont *font, RenFont *fallback) {
+  /* refuse loops; a chain is searched at most 8 fonts deep anyway */
+  for (RenFont *f = fallback; f; f = f->fallback) {
+    if (f == font) { return; }
+  }
+  font->fallback = fallback;
+}
+
+
 void ren_set_font_tab_width(RenFont *font, int n) {
   GlyphSet *set = get_glyphset(font, '\t');
   set->glyphs['\t'].xadvance = n;
@@ -232,11 +278,12 @@ int ren_get_font_width(RenFont *font, const char *text) {
   int x = 0;
   const char *p = text;
   unsigned codepoint;
+  RenFont *owner;
+  GlyphSet *set;
   while (*p) {
     p = utf8_to_codepoint(p, &codepoint);
-    GlyphSet *set = get_glyphset(font, codepoint);
-    stbtt_bakedchar *g = &set->glyphs[codepoint & 0xff];
-    x += g->xadvance;
+    stbtt_bakedchar *g = get_glyph(font, codepoint, &owner, &set);
+    x += glyph_advance(font, owner, g);
   }
   return x;
 }
@@ -337,16 +384,23 @@ int ren_draw_text(RenFont *font, const char *text, int x, int y, RenColor color)
   RenRect rect;
   const char *p = text;
   unsigned codepoint;
+  RenFont *owner;
+  GlyphSet *set;
   while (*p) {
     p = utf8_to_codepoint(p, &codepoint);
-    GlyphSet *set = get_glyphset(font, codepoint);
-    stbtt_bakedchar *g = &set->glyphs[codepoint & 0xff];
+    stbtt_bakedchar *g = get_glyph(font, codepoint, &owner, &set);
+    int advance = glyph_advance(font, owner, g);
+    int dx = 0, dy = 0;
+    if (owner != font) {
+      dy = font->ascent - owner->ascent;
+      dx = (advance - (int) g->xadvance) / 2;   /* center in the cell */
+    }
     rect.x = g->x0;
     rect.y = g->y0;
     rect.width = g->x1 - g->x0;
     rect.height = g->y1 - g->y0;
-    ren_draw_image(set->image, &rect, x + g->xoff, y + g->yoff, color);
-    x += g->xadvance;
+    ren_draw_image(set->image, &rect, x + g->xoff + dx, y + g->yoff + dy, color);
+    x += advance;
   }
   return x;
 }

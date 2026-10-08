@@ -7,10 +7,49 @@ style.scrollbar_size = common.round(4 * SCALE)
 style.caret_width = common.round(2 * SCALE)
 style.tab_width = common.round(170 * SCALE)
 
-style.font = renderer.font.load(EXEDIR .. "/data/fonts/font.ttf", 14 * SCALE)
-style.big_font = renderer.font.load(EXEDIR .. "/data/fonts/font.ttf", 34 * SCALE)
+style.fallback_fonts = {
+  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+  "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+  "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+  "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+  "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",
+  "C:/Windows/Fonts/consola.ttf",
+  "C:/Windows/Fonts/seguisym.ttf",
+}
+
+local fallback_chains = {}
+
+-- first font of the fallback chain for a size (loaded once per size)
+local function fallback_chain(size)
+  if fallback_chains[size] == nil then
+    local first, last = false, nil
+    for _, path in ipairs(style.fallback_fonts) do
+      if system.get_file_info(path) then
+        local ok, font = pcall(renderer.font.load, path, size)
+        if ok then
+          if last then last:set_fallback(font) else first = font end
+          last = font
+        end
+      end
+    end
+    fallback_chains[size] = first
+  end
+  return fallback_chains[size] or nil
+end
+
+-- loads a font that falls back to style.fallback_fonts for missing characters
+function style.load_font(path, size)
+  local font = renderer.font.load(path, size)
+  if not font.set_fallback then return font end
+  local chain = fallback_chain(size)
+  if chain then font:set_fallback(chain) end
+  return font
+end
+
+style.font = style.load_font(EXEDIR .. "/data/fonts/font.ttf", 14 * SCALE)
+style.big_font = style.load_font(EXEDIR .. "/data/fonts/font.ttf", 34 * SCALE)
 style.icon_font = renderer.font.load(EXEDIR .. "/data/fonts/icons.ttf", 14 * SCALE)
-style.code_font = renderer.font.load(EXEDIR .. "/data/fonts/monospace.ttf", 13.5 * SCALE)
+style.code_font = style.load_font(EXEDIR .. "/data/fonts/monospace.ttf", 13.5 * SCALE)
 
 style.background = { common.color "#2e2e32" }
 style.background2 = { common.color "#252529" }

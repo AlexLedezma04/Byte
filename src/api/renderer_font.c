@@ -22,6 +22,23 @@ static int f_set_tab_width(lua_State *L) {
 }
 
 
+static int f_set_fallback(lua_State *L) {
+  RenFont **self = luaL_checkudata(L, 1, API_TYPE_FONT);
+  RenFont *fallback = NULL;
+  if (lua_isnoneornil(L, 2)) {
+    lua_pushnil(L);
+  } else {
+    fallback = *(RenFont**) luaL_checkudata(L, 2, API_TYPE_FONT);
+    lua_createtable(L, 1, 0);
+    lua_pushvalue(L, 2);
+    lua_rawseti(L, -2, 1);
+  }
+  lua_setuservalue(L, 1);
+  ren_set_font_fallback(*self, fallback);
+  return 0;
+}
+
+
 static int f_gc(lua_State *L) {
   RenFont **self = luaL_checkudata(L, 1, API_TYPE_FONT);
   if (*self) { rencache_free_font(*self); }
@@ -48,6 +65,7 @@ static const luaL_Reg lib[] = {
   { "__gc",          f_gc            },
   { "load",          f_load          },
   { "set_tab_width", f_set_tab_width },
+  { "set_fallback",  f_set_fallback  },
   { "get_width",     f_get_width     },
   { "get_height",    f_get_height    },
   { NULL, NULL }
