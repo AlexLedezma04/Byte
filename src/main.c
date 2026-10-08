@@ -39,14 +39,14 @@ static void get_exe_filename(char *buf, int sz) {
   unsigned size = sz;
   _NSGetExecutablePath(buf, &size);
 #else
-  strcpy(buf, "./lite");
+  strcpy(buf, "./byte");
 #endif
 }
 
 
 static void init_window_icon(void) {
 #ifndef _WIN32
-  #include "../icon.inl"
+  #include "../resources/icon.inl"
   (void) icon_rgba_len; /* unused */
   SDL_Surface *surf = SDL_CreateRGBSurfaceFrom(
     icon_rgba, 64, 64,
