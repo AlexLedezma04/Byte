@@ -22,7 +22,21 @@ possible; easy to modify and extend, or to use without doing either.
 | `resources/` | logos (`images/`), app icons and the Windows resource file |
 | `scripts/` | build scripts |
 | `doc/` | documentation and the license |
-| `winlib/` | SDL2 for Windows builds |
+| `winlib/` | SDL3 for Windows builds |
+
+## Building
+Byte embeds Lua 5.5 (in `src/lib/lua/`) and links SDL 3 statically, so the
+binary has no runtime SDL dependency. On Linux:
+
+```sh
+scripts/build_sdl.sh   # once: fetches SDL 3 and builds only what Byte uses
+scripts/build.sh       # builds build/byte
+```
+
+`build_sdl.sh` turns off the SDL subsystems Byte never touches (audio,
+joystick, haptics, sensors, camera, GPU/Vulkan, tray, ...). Without
+`build/deps/sdl3`, `build.sh` falls back to a system-wide SDL 3, or to one at
+`SDL3_PREFIX`.
 
 ## License
 This project is free software; you can redistribute it and/or modify it under
