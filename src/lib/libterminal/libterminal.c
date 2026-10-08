@@ -1,6 +1,7 @@
 /*
-** Terminal emulator, vendored from lite-xl-terminal v1.09
-** https://github.com/adamharrison/lite-xl-terminal
+** Terminal for Byte: process handling from lite-xl-terminal v1.09
+** (https://github.com/adamharrison/lite-xl-terminal), emulation by libvterm
+** (src/lib/libvterm, https://www.leonerd.org.uk/code/libvterm/).
 */
 
 #if _WIN32
@@ -45,123 +46,39 @@
   static int max(int a, int b) { return a > b ? a : b; }
 #endif
 
-#define LIBTERMINAL_BACKBUFFER_PAGE_LINES 200
-#define LIBTERMINAL_CHUNK_SIZE 4096
-#define LIBTERMINAL_MAX_CHUNKS_PROCESSED 10
-#define LIBTERMINAL_NAME_MAX 256
-#define LIBTERMINAL_DEFAULT_TAB_SIZE 8
+#include "../libvterm/vterm.h"
+#include "../libvterm/vterm_internal.h" // for the DEC modes the Lua side asks about
 
+#define LIBTERMINAL_CHUNK_SIZE 4096
+#define LIBTERMINAL_MAX_CHUNKS_PROCESSED 64
+#define LIBTERMINAL_NAME_MAX 256
+
+// Colors handed to Lua are 32-bit numbers: attributes << 24 | r << 16 | g << 8 | b,
+// where an indexed color keeps its index in the r byte.
 typedef enum attributes_e {
-  // Colors
   ATTRIBUTE_UNSET_COLOR = 0,
   ATTRIBUTE_INVERSE_COLOR = 1,
   ATTRIBUTE_INDEX_COLOR = 2,
   ATTRIBUTE_RGB_COLOR = 3,
-  ATTRIBUTE_UNTARGETED_COLOR = 4,
-  // Attributes
   ATTRIBUTE_BOLD = 8,
   ATTRIBUTE_ITALIC = 16,
   ATTRIBUTE_UNDERLINE = 32,
-  ATTRIBUTE_STYLING_MASK = (32 | 16 | 8)
+  ATTRIBUTE_WIDE = 64,                               // A double-width character, padded with a space so it spans two columns.
 } attributes_e;
 
-typedef struct color_t {
-  union {
-    struct {
-      uint8_t attributes;
-      union {
-        struct {
-          uint8_t r;
-          uint8_t g;
-          uint8_t b;
-        };
-        uint8_t index;
-      };
-    };
-    uint32_t value;
-  };
-} color_t;
-static color_t indexed_color(uint8_t index) { return (color_t) { .attributes = ATTRIBUTE_INDEX_COLOR, .index = index }; }
-static color_t rgb_color(uint8_t r, uint8_t g, uint8_t b) { return (color_t) { .attributes = ATTRIBUTE_RGB_COLOR, .r = r, .g = g, .b = b }; }
-static color_t UNSET_COLOR = { .attributes = ATTRIBUTE_UNSET_COLOR, .index = 0 };
-static color_t INVERSE_COLOR = { .attributes = ATTRIBUTE_INVERSE_COLOR, .index = 0 };
-static color_t UNTARGETED_COLOR = { .attributes = ATTRIBUTE_UNTARGETED_COLOR, .index = 0 };
+// A cell as stored in the scrollback and handed to Lua; colors are encoded as above, before reverse video.
+typedef struct cell_t {
+  uint32_t chars[2];                                 // Base character and one combining character (e.g. an emoji variation selector).
+  uint32_t fg, bg;
+  uint8_t width;                                     // 1, 2, or 0 for the right half of a wide character.
+  uint8_t reverse;
+} cell_t;
 
-#define LIBTERMINAL_NO_STYLING (buffer_styling_t) { UNSET_COLOR, UNSET_COLOR }
-
-typedef struct buffer_styling_t {
-  union {
-    struct {
-      color_t foreground;
-      color_t background;
-    };
-    uint64_t value;
-  };
-} buffer_styling_t;
-
-typedef struct buffer_char_t {
-  buffer_styling_t styling;
-  uint32_t codepoint;
-} buffer_char_t;
-
-typedef struct backbuffer_page_t {
-  struct backbuffer_page_t* prev;
-  struct backbuffer_page_t* next;
-  int columns, lines, line;
-  buffer_char_t buffer[];
-} backbuffer_page_t;
-
-typedef enum view_e {
-  VIEW_NORMAL_BUFFER = 0,
-  VIEW_ALTERNATE_BUFFER = 1,
-  VIEW_MAX = 2
-} view_e;
-
-typedef enum cursor_mode_e {
-  CURSOR_SOLID         = 0,
-  CURSOR_HIDDEN        = 1,
-  CURSOR_BLINKING      = 2,
-} cursor_mode_e;
-
-typedef enum paste_mode_e {
-  PASTE_NORMAL,
-  PASTE_BRACKETED
-} paste_mode_e;
-
-typedef enum keys_mode_e {
-  KEYS_MODE_NORMAL,
-  KEYS_MODE_APPLICATION
-} keys_mode_e;
-
-typedef enum mouse_tracking_mode_e {
-  MOUSE_TRACKING_NONE,
-  MOUSE_TRACKING_X10,
-  MOUSE_TRACKING_NORMAL,
-  MOUSE_TRACKING_SGR
-} mouse_tracking_mode_e;
-
-typedef enum charset_e {
-  CHARSET_US,
-  CHARSET_DEC,
-  CHARSET_OTHER
-} charset_e;
-
-typedef struct view_t {
-  buffer_char_t* buffer;
-  int* overflows;
-  int cursor_x, cursor_y;
-  int cursor_styling_inversed;
-  buffer_styling_t cursor_styling;
-  cursor_mode_e cursor_mode;
-  keys_mode_e cursor_keys_mode;
-  keys_mode_e keypad_keys_mode;
-  mouse_tracking_mode_e mouse_tracking_mode;
-  color_t palette[256];                // Custom palette as per the ^][4;#;rgb:24/04/3C command. The fuck?
-  charset_e charset;
-  int last_graphical_character;
-  int tab_size;
-  int scrolling_region_start, scrolling_region_end;
-} view_t;
+typedef struct scrollback_line_t {
+  int columns;
+  int continuation;                                  // Whether this line wraps into the next one.
+  cell_t cells[];
+} scrollback_line_t;
 
 typedef enum mode_e {
   MODE_PTY,
@@ -170,54 +87,36 @@ typedef enum mode_e {
 
 typedef struct {
   int debug;                                         // If true, dumps output to working directory in a file called `terminal.log`.
-  backbuffer_page_t* scrollback_buffer_end;          // End of the linked list.
-  backbuffer_page_t* scrollback_buffer_start;        // Beginning of linked list.
-  backbuffer_page_t* scrollback_target;              // Target based on scrollback_position.
-  int scrollback_target_top_offset;                  // The offset that the top of the scrollback_target page is from the start of the buffer.
-  int scrollback_total_lines;                        // Cached total amount of lines we can scroll back.
-  int scrollback_position;                           // Canonical amount of lines we've scrolled back.
-  int scrollback_limit;                              // The amount of lines we'll hold in memory maximum.
+  VTerm* vt;
+  VTermScreen* screen;
+  VTermState* state;
   int columns, lines;
-  view_e current_view;
-  view_t views[VIEW_MAX];                            // Normally just two buffers, normal, and alternate.
-  paste_mode_e paste_mode;
-  mode_e mode;                                       // The mode the terminal is in.
-  int reporting_focus;                               // Enables/disbles reporting focus.
-  char name[LIBTERMINAL_NAME_MAX];                   // Window name, set with OS command.
-  char buffered_sequence[LIBTERMINAL_CHUNK_SIZE];
+  scrollback_line_t** scrollback;                    // Ring buffer of lines scrolled off the top, newest at (scrollback_head - 1).
+  int scrollback_limit, scrollback_head, scrollback_count;
+  int scrollback_position;                           // How many lines the view is scrolled back.
+  int shifts;                                        // Lines pushed into the scrollback since the last update.
+  int cursor_x, cursor_y, cursor_visible, cursor_blink;
+  int alt_screen;
+  int mouse_mode;                                    // VTERM_PROP_MOUSE_*
+  mode_e mode;
+  char name[LIBTERMINAL_NAME_MAX];                   // Window title, set with an OSC 0/2.
+  int name_length;
   #if _WIN32
     PROCESS_INFORMATION process_information;
     HPCON hpcon;
     HANDLE topty;
     HANDLE frompty;
-    char nonblocking_buffer[LIBTERMINAL_CHUNK_SIZE];   // Oh my god, I hate windows so much.
+    char nonblocking_buffer[LIBTERMINAL_CHUNK_SIZE];
     int nonblocking_buffer_length;
     HANDLE nonblocking_buffer_mutex;
     HANDLE nonblocking_thread;
     int closing;
   #else
-    int master;                                        // FD for pty.
-    pid_t pid;                                         // pid for shell.
+    int master;                                      // FD for pty.
+    pid_t pid;                                       // pid for shell.
   #endif
 } terminal_t;
 
-
-static int utf8_to_codepoint(const char *p, unsigned *dst) {
-  const unsigned char *up = (unsigned char*)p;
-  unsigned res, n;
-  switch (*p & 0xf0) {
-    case 0xf0 :  res = *up & 0x07;  n = 3;  break;
-    case 0xe0 :  res = *up & 0x0f;  n = 2;  break;
-    case 0xd0 :
-    case 0xc0 :  res = *up & 0x1f;  n = 1;  break;
-    default   :  res = *up;         n = 0;  break;
-  }
-  while (n--) {
-    res = (res << 6) | (*(++up) & 0x3f);
-  }
-  *dst = res;
-  return ((const char*)up + 1) - p;
-}
 
 static int codepoint_to_utf8(unsigned int codepoint, char* target) {
   if (codepoint < 128) {
@@ -240,722 +139,198 @@ static int codepoint_to_utf8(unsigned int codepoint, char* target) {
   return 4;
 }
 
-// Starts searching for the desired scrollback page based on offset, given the starting page of start; should pass NULL if you don't care.
-static backbuffer_page_t* terminal_find_scrollback_page(terminal_t* terminal, backbuffer_page_t* start, int* offset, int* top_offset) {
-  if (!terminal->scrollback_buffer_start || *offset <= 0) {
-    *offset = 0;
-    *top_offset = 0;
+
+// --- conversions between libvterm cells and our cells
+
+static uint32_t encode_color(const VTermColor* color, int foreground) {
+  if (foreground ? VTERM_COLOR_IS_DEFAULT_FG(color) : VTERM_COLOR_IS_DEFAULT_BG(color))
+    return ATTRIBUTE_UNSET_COLOR;
+  if (VTERM_COLOR_IS_INDEXED(color))
+    return ((uint32_t)ATTRIBUTE_INDEX_COLOR << 24) | ((uint32_t)color->indexed.idx << 16);
+  return ((uint32_t)ATTRIBUTE_RGB_COLOR << 24) | ((uint32_t)color->rgb.red << 16) | ((uint32_t)color->rgb.green << 8) | color->rgb.blue;
+}
+
+static void decode_color(terminal_t* terminal, uint32_t value, int foreground, VTermColor* color) {
+  switch (value >> 24 & 7) {
+    case ATTRIBUTE_INDEX_COLOR: vterm_color_indexed(color, (value >> 16) & 0xFF); break;
+    case ATTRIBUTE_RGB_COLOR: vterm_color_rgb(color, (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF); break;
+    default: {
+      VTermColor fg, bg;
+      vterm_state_get_default_colors(terminal->state, &fg, &bg);
+      *color = foreground ? fg : bg;
+    } break;
+  }
+}
+
+static void cell_from_vterm(const VTermScreenCell* in, cell_t* out) {
+  out->chars[0] = in->chars[0] == (uint32_t)-1 ? 0 : in->chars[0];
+  out->chars[1] = in->chars[0] && in->chars[0] != (uint32_t)-1 ? in->chars[1] : 0;
+  out->width = in->chars[0] == (uint32_t)-1 ? 0 : (uint8_t)in->width;
+  out->fg = encode_color(&in->fg, 1);
+  out->bg = encode_color(&in->bg, 0);
+  if (in->attrs.bold) out->fg |= (uint32_t)ATTRIBUTE_BOLD << 24;
+  if (in->attrs.italic) out->fg |= (uint32_t)ATTRIBUTE_ITALIC << 24;
+  if (in->attrs.underline) out->fg |= (uint32_t)ATTRIBUTE_UNDERLINE << 24;
+  out->reverse = in->attrs.reverse;
+}
+
+static void cell_to_vterm(terminal_t* terminal, const cell_t* in, VTermScreenCell* out) {
+  memset(out, 0, sizeof(*out));
+  out->chars[0] = in->width == 0 ? (uint32_t)-1 : in->chars[0];
+  out->chars[1] = in->chars[1];
+  out->width = in->width ? in->width : 1;
+  decode_color(terminal, in->fg, 1, &out->fg);
+  decode_color(terminal, in->bg, 0, &out->bg);
+  uint32_t attributes = in->fg >> 24;
+  out->attrs.bold = !!(attributes & ATTRIBUTE_BOLD);
+  out->attrs.italic = !!(attributes & ATTRIBUTE_ITALIC);
+  out->attrs.underline = !!(attributes & ATTRIBUTE_UNDERLINE);
+  out->attrs.reverse = in->reverse;
+}
+
+
+// --- scrollback
+
+static scrollback_line_t* terminal_scrollback_line(terminal_t* terminal, int index) { // index 0 is the newest
+  if (index < 0 || index >= terminal->scrollback_count)
     return NULL;
+  int i = (terminal->scrollback_head - 1 - index + terminal->scrollback_limit) % terminal->scrollback_limit;
+  return terminal->scrollback[i];
+}
+
+static void terminal_clear_scrollback_buffer(terminal_t* terminal) {
+  for (int i = 0; i < terminal->scrollback_limit && terminal->scrollback; ++i) {
+    free(terminal->scrollback[i]);
+    terminal->scrollback[i] = NULL;
   }
-  while (*offset > *top_offset) {
-    if (!start) {
-      start = terminal->scrollback_buffer_start;
-      *top_offset = start->line;
-    } else {
-      if (!start->prev) {
-        *offset = *top_offset;
-        return start;
-      }
-      start = start->prev;
-      *top_offset += start->line;
-    }
-  }
-  while (*offset < (*top_offset - start->line)) {
-    if (!start->next) {
-      *offset = 0;
-      *top_offset = 0;
-      return NULL;
-    }
-    *top_offset -= start->line;
-    start = start->next;
-  }
-  return start;
+  terminal->scrollback_head = terminal->scrollback_count = terminal->scrollback_position = 0;
 }
 
 static int terminal_scrollback(terminal_t* terminal, int target) {
-  terminal->scrollback_target = terminal_find_scrollback_page(terminal, terminal->scrollback_target, &target, &terminal->scrollback_target_top_offset);
-  terminal->scrollback_position = target;
+  terminal->scrollback_position = max(0, min(target, terminal->scrollback_count));
   return terminal->scrollback_position;
 }
 
-static int terminal_output(terminal_t* terminal, const char* str, int len);
+static int on_sb_pushline(int cols, const VTermScreenCell* cells, void* user) {
+  terminal_t* terminal = user;
+  if (terminal->scrollback_limit <= 0)
+    return 0;
+  scrollback_line_t* line = malloc(sizeof(scrollback_line_t) + sizeof(cell_t) * cols);
+  if (!line)
+    return 0;
+  line->columns = cols;
+  const VTermLineInfo* info = vterm_state_get_lineinfo(terminal->state, 1);
+  line->continuation = terminal->lines > 1 && info && info->continuation;
+  for (int i = 0; i < cols; ++i)
+    cell_from_vterm(&cells[i], &line->cells[i]);
+  free(terminal->scrollback[terminal->scrollback_head]);
+  terminal->scrollback[terminal->scrollback_head] = line;
+  terminal->scrollback_head = (terminal->scrollback_head + 1) % terminal->scrollback_limit;
+  if (terminal->scrollback_count < terminal->scrollback_limit)
+    terminal->scrollback_count++;
+  else if (terminal->scrollback_position > 0)
+    terminal->scrollback_position = min(terminal->scrollback_position, terminal->scrollback_count);
+  terminal->shifts++;
+  return 1;
+}
+
+// When the screen grows, libvterm pulls lines back down from the scrollback.
+static int on_sb_popline(int cols, VTermScreenCell* cells, void* user) {
+  terminal_t* terminal = user;
+  if (terminal->scrollback_count == 0)
+    return 0;
+  terminal->scrollback_head = (terminal->scrollback_head - 1 + terminal->scrollback_limit) % terminal->scrollback_limit;
+  scrollback_line_t* line = terminal->scrollback[terminal->scrollback_head];
+  terminal->scrollback[terminal->scrollback_head] = NULL;
+  terminal->scrollback_count--;
+  terminal->scrollback_position = min(terminal->scrollback_position, terminal->scrollback_count);
+  cell_t blank = { { 0, 0 }, 0, 0, 1, 0 };
+  for (int i = 0; i < cols; ++i)
+    cell_to_vterm(terminal, i < line->columns ? &line->cells[i] : &blank, &cells[i]);
+  free(line);
+  return 1;
+}
+
+static int on_sb_clear(void* user) {
+  terminal_clear_scrollback_buffer((terminal_t*)user);
+  return 1;
+}
+
+static int on_movecursor(VTermPos pos, VTermPos oldpos, int visible, void* user) {
+  terminal_t* terminal = user;
+  terminal->cursor_x = pos.col;
+  terminal->cursor_y = pos.row;
+  return 1;
+}
+
+static int on_settermprop(VTermProp prop, VTermValue* val, void* user) {
+  terminal_t* terminal = user;
+  switch (prop) {
+    case VTERM_PROP_CURSORVISIBLE: terminal->cursor_visible = val->boolean; break;
+    case VTERM_PROP_CURSORBLINK: terminal->cursor_blink = val->boolean; break;
+    case VTERM_PROP_ALTSCREEN: terminal->alt_screen = val->boolean; break;
+    case VTERM_PROP_MOUSE: terminal->mouse_mode = val->number; break;
+    case VTERM_PROP_TITLE: {
+      if (val->string.initial)
+        terminal->name_length = 0;
+      size_t n = min((int)val->string.len, (int)sizeof(terminal->name) - 1 - terminal->name_length);
+      memcpy(&terminal->name[terminal->name_length], val->string.str, n);
+      terminal->name_length += n;
+      terminal->name[terminal->name_length] = 0;
+    } break;
+    default: break;
+  }
+  return 1;
+}
+
+static VTermScreenCallbacks screen_callbacks = {
+  .movecursor = on_movecursor,
+  .settermprop = on_settermprop,
+  .sb_pushline = on_sb_pushline,
+  .sb_popline = on_sb_popline,
+  .sb_clear = on_sb_clear,
+};
+
+
+// --- I/O
+
 static void terminal_input(terminal_t* terminal, const char* str, int len) {
   if (terminal->mode == MODE_PTY) {
     #ifdef _WIN32
       WriteFile(terminal->topty, str, len, NULL, NULL);
     #else
-      write(terminal->master, str, len);
-    #endif
-  } else
-    terminal_output(terminal, str, len);
-}
-
-static void terminal_clear_scrollback_buffer(terminal_t* terminal) {
-  backbuffer_page_t* scrollback_buffer = terminal->scrollback_buffer_start;
-  while (scrollback_buffer) {
-      backbuffer_page_t* prev = scrollback_buffer->prev;
-      free(scrollback_buffer);
-      scrollback_buffer = prev;
-  }
-  terminal->scrollback_buffer_start = NULL;
-  terminal->scrollback_buffer_end = NULL;
-  terminal->scrollback_target = NULL;
-  terminal->scrollback_target_top_offset = 0;
-  terminal->scrollback_total_lines = 0;
-}
-
-static void terminal_shift_buffer(terminal_t* terminal) {
-  view_t* view = &terminal->views[terminal->current_view];
-
-  if (view->scrolling_region_start != -1 && view->scrolling_region_end != -1) {
-    int start = min(view->scrolling_region_start, terminal->lines - 1);
-    int start_plus_1 = min((view->scrolling_region_start + 1), terminal->lines - 1);
-    int end = min(view->scrolling_region_end, terminal->lines);
-    if (start_plus_1 != start && end - start_plus_1 > 0) {
-      memmove(&view->buffer[terminal->columns * start], &view->buffer[terminal->columns * start_plus_1], sizeof(buffer_char_t) * terminal->columns * (end - start_plus_1));
-      memmove(&view->overflows[start], &view->overflows[start_plus_1], sizeof(int) * (end - start_plus_1));
-    }
-    memset(&view->buffer[terminal->columns * max(end - 1 , 0)], 0, sizeof(buffer_char_t) * terminal->columns);
-    view->overflows[max(end - 1, 0)] = 0;
-    return;
-  }
-  if (terminal->current_view == VIEW_NORMAL_BUFFER) {
-    if (terminal->scrollback_total_lines++ > terminal->scrollback_limit) {
-      backbuffer_page_t* page = terminal->scrollback_buffer_end;
-      if (page->next)
-        page->next->prev = NULL;
-      terminal->scrollback_buffer_end = page->next;
-      terminal->scrollback_total_lines -= page->line;
-      if (terminal->scrollback_target == page) {
-        terminal->scrollback_target = NULL;
-        terminal->scrollback_target_top_offset = 0;
+      while (len > 0) {
+        ssize_t written = write(terminal->master, str, len);
+        if (written < 0) {
+          if (errno == EAGAIN || errno == EINTR) { usleep(1000); continue; }
+          break;
+        }
+        str += written;
+        len -= written;
       }
-      terminal->scrollback_position = min(terminal->scrollback_position, terminal->scrollback_total_lines);
-      free(page);
-    }
-    if (!terminal->scrollback_buffer_start || terminal->scrollback_buffer_start->columns != terminal->columns || terminal->scrollback_buffer_start->line >= terminal->scrollback_buffer_start->lines) {
-      backbuffer_page_t* page = calloc(sizeof(backbuffer_page_t) + LIBTERMINAL_BACKBUFFER_PAGE_LINES*terminal->columns*sizeof(buffer_char_t) + sizeof(int)*LIBTERMINAL_BACKBUFFER_PAGE_LINES, 1);
-      if (!terminal->scrollback_buffer_start)
-        terminal->scrollback_buffer_end = page;
-      backbuffer_page_t* prev = terminal->scrollback_buffer_start;
-      page->prev = prev;
-      if (prev)
-        prev->next = page;
-      terminal->scrollback_buffer_start = page;
-      page->lines = LIBTERMINAL_BACKBUFFER_PAGE_LINES;
-      page->columns = terminal->columns;
-      page->line = 0;
-    }
-    memcpy(&terminal->scrollback_buffer_start->buffer[terminal->scrollback_buffer_start->line * terminal->columns], &view->buffer[0], sizeof(buffer_char_t) * terminal->columns);
-    int* backbuffer_overflows = (int*)&terminal->scrollback_buffer_start->buffer[LIBTERMINAL_BACKBUFFER_PAGE_LINES*terminal->scrollback_buffer_start->columns];
-    backbuffer_overflows[terminal->scrollback_buffer_start->line] = view->overflows[0];
-    terminal->scrollback_buffer_start->line++;
-  }
-  memmove(&view->buffer[0], &view->buffer[terminal->columns], sizeof(buffer_char_t) * terminal->columns * (terminal->lines - 1));
-  memmove(&view->overflows[0], &view->overflows[1], sizeof(int) * (terminal->lines - 1));
-  memset(&view->buffer[terminal->columns * (terminal->lines - 1)], 0, sizeof(buffer_char_t) * terminal->columns);
-  view->overflows[terminal->lines - 1] = 0;
-}
-
-static void terminal_switch_buffer(terminal_t* terminal, view_e view) {
-  terminal->current_view = view;
-  if (view == VIEW_ALTERNATE_BUFFER) {
-    memset(terminal->views[VIEW_ALTERNATE_BUFFER].buffer, 0, sizeof(buffer_char_t) * terminal->columns * terminal->lines);
-    memset(terminal->views[VIEW_ALTERNATE_BUFFER].overflows, 0, terminal->lines * sizeof(int));
-    terminal->views[VIEW_ALTERNATE_BUFFER].cursor_x = 0;
-    terminal->views[VIEW_ALTERNATE_BUFFER].cursor_y = 0;
-    terminal->views[VIEW_ALTERNATE_BUFFER].cursor_styling = LIBTERMINAL_NO_STYLING;
-    terminal->views[VIEW_ALTERNATE_BUFFER].cursor_styling_inversed = 0;
-    terminal->views[VIEW_ALTERNATE_BUFFER].scrolling_region_end = -1;
-    terminal->views[VIEW_ALTERNATE_BUFFER].scrolling_region_start = -1;
-    for (int i = 0; i < 256; ++i)
-      terminal->views[VIEW_ALTERNATE_BUFFER].palette[i] = indexed_color(i);
-  }
-}
-
-static int parse_number(const char* seq, int def) {
-  if (seq[0] >= '0' && seq[0] <= '9')
-    return atoi(seq);
-  return def;
-}
-
-typedef enum terminal_escape_type_e {
-  ESCAPE_TYPE_NONE,
-  ESCAPE_TYPE_OPEN,
-  ESCAPE_TYPE_CSI,
-  ESCAPE_TYPE_OS,
-  ESCAPE_TYPE_FIXED_WIDTH,
-  ESCAPE_TYPE_UNKNOWN
-} terminal_escape_type_e;
-
-
-static int terminal_escape_sequence(terminal_t* terminal, terminal_escape_type_e type, const char* seq) {
-  #ifdef LIBTERMINAL_DEBUG_ESCAPE
-  fprintf(stderr, "ESC");
-  for (int i = 1; i < strlen(seq); ++i) {
-    fprintf(stderr, "%c", seq[i]);
-  }
-  fprintf(stderr, "\n");
-  #endif
-  view_t* view = &terminal->views[terminal->current_view];
-  int unhandled = 0;
-  int end = (view->scrolling_region_end == -1 ? terminal->lines : view->scrolling_region_end);
-  if (type == ESCAPE_TYPE_CSI) {
-    int seq_end = strlen(seq) - 1;
-    switch (seq[seq_end]) {
-      case '@': {
-        int length = parse_number(&seq[2], 1);
-        memmove(&view->buffer[terminal->columns * view->cursor_y + view->cursor_x + length], &view->buffer[terminal->columns * view->cursor_y + view->cursor_x], sizeof(buffer_char_t) * max(terminal->columns - (view->cursor_x + length), 0));
-        for (int i = view->cursor_x; i < min(view->cursor_x + length, terminal->columns); ++i)
-          view->buffer[terminal->columns * view->cursor_y + i].codepoint = ' ';
-      } break;
-      case 'A': view->cursor_y = max(view->cursor_y - max(parse_number(&seq[2], 1), 1), 0);     break;
-      case 'B': view->cursor_y = min(view->cursor_y + max(parse_number(&seq[2], 1), 1), terminal->lines - 1); break;
-      case 'C': view->cursor_x = min(view->cursor_x + max(parse_number(&seq[2], 1), 1), terminal->columns - 1); break;
-      case 'D': view->cursor_x = max(view->cursor_x - max(parse_number(&seq[2], 1), 1), 0); break;
-      case 'E': view->cursor_y = min(view->cursor_y + max(parse_number(&seq[2], 1), 1), terminal->lines - 1); view->cursor_x = 0; break;
-      case 'F': view->cursor_y = min(view->cursor_y - max(parse_number(&seq[2], 1), 1), 0); view->cursor_x = 0; break;
-      case 'G': view->cursor_x = min(max(max(parse_number(&seq[2], 1), 1) - 1, 0), terminal->columns - 1); break;
-      case 'f':
-      case 'H': {
-        int semicolon = -1;
-        for (semicolon = 2; semicolon < seq_end && seq[semicolon] != ';'; ++semicolon);
-        if (seq[semicolon] != ';') {
-          view->cursor_x = 0;
-          view->cursor_y = 0;
-        } else {
-          view->cursor_y = max(min(parse_number(&seq[2], 1) - 1, terminal->lines - 1), 0);
-          view->cursor_x = max(min(parse_number(&seq[semicolon+1], 1) - 1, terminal->columns - 1), 0);
-        }
-      } break;
-      case 'J': {
-        switch (seq[2]) {
-          case '1':
-            for (int y = 0; y <= view->cursor_y; ++y) {
-              int w = y == view->cursor_y ? (view->cursor_x+1) : terminal->columns;
-              memset(&view->buffer[terminal->columns * y], 0, sizeof(buffer_char_t) * w);
-            }
-          break;
-          case '3':
-            terminal_clear_scrollback_buffer(terminal);
-            // intentional fallthrough
-          case '2':
-            memset(view->buffer, 0, sizeof(buffer_char_t) * (terminal->columns * terminal->lines));
-            view->cursor_x = 0;
-            view->cursor_y = 0;
-          break;
-          default:
-            for (int y = view->cursor_y; y < terminal->lines; ++y) {
-              int x = y == view->cursor_y ? view->cursor_x : 0;
-              memset(&view->buffer[terminal->columns * y + x], 0, sizeof(buffer_char_t) * (terminal->columns - x));
-            }
-          break;
-        }
-      } break;
-      case 'K': {
-        int s, e;
-        switch (seq[2]) {
-          case '1': s = 0; e = view->cursor_x + 1; break;
-          case '2': s = 0; e = terminal->columns; break;
-          default: s = view->cursor_x; e = terminal->columns; break;
-        }
-        for (int i = s; i < e; ++i)
-          view->buffer[view->cursor_y * terminal->columns + i] = (buffer_char_t){ view->cursor_styling, ' ' };
-      } break;
-      case 'L': {
-        int length = parse_number(&seq[2], 1);
-        memmove(&view->buffer[terminal->columns * (view->cursor_y + length)], &view->buffer[terminal->columns * view->cursor_y], sizeof(buffer_char_t) * terminal->columns * max(end - (view->cursor_y + length), 0));
-        for (int y = view->cursor_y; y < min(view->cursor_y + length, end); ++y) {
-          for (int i = 0; i < terminal->columns; ++i)
-            view->buffer[terminal->columns * y + i].codepoint = ' ';
-        }
-      } break;
-      case 'M': {
-        int length = parse_number(&seq[2], 1);
-        memmove(&view->buffer[terminal->columns * view->cursor_y], &view->buffer[terminal->columns * (view->cursor_y + length)], sizeof(buffer_char_t) * terminal->columns * max(end - (view->cursor_y + length), 0));
-        for (int y = end - length; y < end; ++y) {
-          for (int i = 0; i < terminal->columns; ++i)
-            view->buffer[terminal->columns * y + i].codepoint = ' ';
-        }
-      } break;
-      case 'P': {
-        int length = parse_number(&seq[2], 1);
-        for (int i = view->cursor_x; i < terminal->columns; ++i) {
-          if (i + length < terminal->columns)
-            view->buffer[view->cursor_y * terminal->columns + i] = view->buffer[view->cursor_y * terminal->columns + i + length];
-          else
-            view->buffer[view->cursor_y * terminal->columns + i].codepoint = ' ';
-        }
-      } break;
-      case 'X': {
-        int length = parse_number(&seq[2], 1);
-        for (int i = view->cursor_x; i < view->cursor_x + length && i < terminal->columns; ++i)
-          view->buffer[view->cursor_y * terminal->columns + i] = (buffer_char_t){ view->cursor_styling, ' ' };
-      } break;
-      case 'b': {
-        if (view->last_graphical_character) {
-          int length = parse_number(&seq[2], 1);
-          for (int i = view->cursor_x; i < min(view->cursor_x + length, terminal->columns); ++i)
-            view->buffer[view->cursor_y * terminal->columns + i].codepoint = view->last_graphical_character;
-        }
-      } break;
-      case 'c': {
-        terminal_input(terminal, "\e[?1;2c", 7);
-      } break;
-      case 'd': view->cursor_y = min(max(max(parse_number(&seq[2], 1), 1) - 1, 0), terminal->lines - 1); break;
-      case 'h': {
-        if (seq[2] == '?') {
-          const char* next = &seq[3];
-          while (next) {
-            switch (parse_number(next, 0)) {
-              case 1: view->cursor_keys_mode = KEYS_MODE_APPLICATION; break;
-              case 9: view->mouse_tracking_mode = MOUSE_TRACKING_X10; break;
-              case 12: view->cursor_mode = CURSOR_BLINKING; break;
-              case 25: view->cursor_mode = CURSOR_SOLID; break;
-              case 1000: if (view->mouse_tracking_mode != MOUSE_TRACKING_SGR) view->mouse_tracking_mode = MOUSE_TRACKING_NORMAL; break;
-              case 1006: view->mouse_tracking_mode = MOUSE_TRACKING_SGR; break;
-              case 1004: terminal->reporting_focus = 1; break;
-              case 1047: terminal_switch_buffer(terminal, VIEW_ALTERNATE_BUFFER); break;
-              case 1049: terminal_switch_buffer(terminal, VIEW_ALTERNATE_BUFFER); break;
-              case 2004: terminal->paste_mode = PASTE_BRACKETED; break;
-              default: unhandled = 1; break;
-            }
-            if ((next = strstr(next, ";")))
-              next++;
-          }
-        }
-      } break;
-      case 'l': {
-        if (seq[2] == '?') {
-          const char* next = &seq[3];
-          while (next) {
-            switch (parse_number(next, 0)) {
-              case 1: view->cursor_keys_mode = KEYS_MODE_NORMAL; break;
-              case 9: view->mouse_tracking_mode = MOUSE_TRACKING_NONE; break;
-              case 12: view->cursor_mode = CURSOR_SOLID; break;
-              case 25: view->cursor_mode = CURSOR_HIDDEN; break;
-              case 1000: view->mouse_tracking_mode = MOUSE_TRACKING_NONE; break;
-              case 1006: view->mouse_tracking_mode = MOUSE_TRACKING_NONE; break;
-              case 1004: terminal->reporting_focus = 0; break;
-              case 1047: terminal_switch_buffer(terminal, VIEW_NORMAL_BUFFER); break;
-              case 1049: terminal_switch_buffer(terminal, VIEW_NORMAL_BUFFER); break;
-              case 2004: terminal->paste_mode = PASTE_NORMAL; break;
-              default: unhandled = 1; break;
-            }
-            if (next = strstr(next, ";"))
-              next++;
-          }
-        }
-      } break;
-      case 'm': {
-        int offset = 2;
-        enum DisplayState {
-          DISPLAY_STATE_NONE,
-          DISPLAY_STATE_COLOR_MODE,
-          DISPLAY_STATE_COLOR_VALUE_IDX,
-          DISPLAY_STATE_COLOR_VALUE_R,
-          DISPLAY_STATE_COLOR_VALUE_G,
-          DISPLAY_STATE_COLOR_VALUE_B
-        };
-        enum DisplayState state = DISPLAY_STATE_NONE;
-        uint8_t r = 0,g = 0,b = 0;
-        int foreground = 0;
-        while (1) {
-          color_t target_color = UNTARGETED_COLOR;
-          int target_foreground = 0;
-          switch (state) {
-            case DISPLAY_STATE_NONE: {
-              int display_number = parse_number(&seq[offset], 0);
-              switch (display_number) {
-                case 0  : view->cursor_styling = LIBTERMINAL_NO_STYLING; view->cursor_styling_inversed = 0; break;
-                case 1  : view->cursor_styling.foreground.attributes |= ATTRIBUTE_BOLD; break;
-                case 3  : view->cursor_styling.foreground.attributes |= ATTRIBUTE_ITALIC; break;
-                case 4  : view->cursor_styling.foreground.attributes |= ATTRIBUTE_UNDERLINE; break;
-                case 27:
-                case 7  : {
-                  int is_inversed = display_number == 7;
-                  if (is_inversed != view->cursor_styling_inversed) {
-                    view->cursor_styling_inversed = is_inversed;
-                    color_t background = view->cursor_styling.background;
-                    if (view->cursor_styling.foreground.value == UNSET_COLOR.value)
-                      view->cursor_styling.background = INVERSE_COLOR;
-                    else if (view->cursor_styling.foreground.value == INVERSE_COLOR.value)
-                      view->cursor_styling.background = UNSET_COLOR;
-                    else
-                      view->cursor_styling.background = view->cursor_styling.foreground;
-                    if (background.value == UNSET_COLOR.value)
-                      view->cursor_styling.foreground = INVERSE_COLOR;
-                    else if (background.value == INVERSE_COLOR.value)
-                      view->cursor_styling.foreground = UNSET_COLOR;
-                    else
-                      view->cursor_styling.foreground = view->cursor_styling.background;
-                  }
-                } break;
-                case 30 : target_foreground = 1; target_color = view->palette[0]; break;
-                case 31 : target_foreground = 1; target_color = view->palette[1]; break;
-                case 32 : target_foreground = 1; target_color = view->palette[2]; break;
-                case 33 : target_foreground = 1; target_color = view->palette[3]; break;
-                case 34 : target_foreground = 1; target_color = view->palette[4]; break;
-                case 35 : target_foreground = 1; target_color = view->palette[5]; break;
-                case 36 : target_foreground = 1; target_color = view->palette[6]; break;
-                case 37 : target_foreground = 1; target_color = view->palette[7]; break;
-                case 38 : state = DISPLAY_STATE_COLOR_MODE; foreground = 1; break;
-                case 39 : target_foreground = 1; target_color = UNSET_COLOR; break;
-                case 40 : target_foreground = 0; target_color = view->palette[0]; break;
-                case 41 : target_foreground = 0; target_color = view->palette[1]; break;
-                case 42 : target_foreground = 0; target_color = view->palette[2]; break;
-                case 43 : target_foreground = 0; target_color = view->palette[3]; break;
-                case 44 : target_foreground = 0; target_color = view->palette[4]; break;
-                case 45 : target_foreground = 0; target_color = view->palette[5]; break;
-                case 46 : target_foreground = 0; target_color = view->palette[6]; break;
-                case 47 : target_foreground = 0; target_color = view->palette[7]; break;
-                case 48 : state = DISPLAY_STATE_COLOR_MODE; foreground = 0; break;
-                case 49 : target_foreground = 0; target_color = UNSET_COLOR; break;
-                case 90 : target_foreground = 1; target_color = view->palette[8]; break;
-                case 91 : target_foreground = 1; target_color = view->palette[9]; break;
-                case 92 : target_foreground = 1; target_color = view->palette[10]; break;
-                case 93 : target_foreground = 1; target_color = view->palette[11]; break;
-                case 94 : target_foreground = 1; target_color = view->palette[12]; break;
-                case 95 : target_foreground = 1; target_color = view->palette[13]; break;
-                case 96 : target_foreground = 1; target_color = view->palette[14]; break;
-                case 97 : target_foreground = 1; target_color = view->palette[15]; break;
-                case 100: target_foreground = 0; target_color = view->palette[8]; break;
-                case 101: target_foreground = 0; target_color = view->palette[9]; break;
-                case 102: target_foreground = 0; target_color = view->palette[10]; break;
-                case 103: target_foreground = 0; target_color = view->palette[11]; break;
-                case 104: target_foreground = 0; target_color = view->palette[12]; break;
-                case 105: target_foreground = 0; target_color = view->palette[13]; break;
-                case 106: target_foreground = 0; target_color = view->palette[14]; break;
-                case 107: target_foreground = 0; target_color = view->palette[15]; break;
-                default: unhandled = 1; break;
-              }
-            } break;
-            case DISPLAY_STATE_COLOR_MODE: state = parse_number(&seq[offset], 0) != 5 ? DISPLAY_STATE_COLOR_VALUE_R : DISPLAY_STATE_COLOR_VALUE_IDX; break;
-            case DISPLAY_STATE_COLOR_VALUE_IDX:
-              target_foreground = foreground;
-              int idx = (parse_number(&seq[offset], 0) & 0xFF);
-              target_color = view->palette[idx];
-              state = DISPLAY_STATE_NONE;
-            break;
-            case DISPLAY_STATE_COLOR_VALUE_R: r = (parse_number(&seq[offset], 0) & 0xFF); state = DISPLAY_STATE_COLOR_VALUE_G; break;
-            case DISPLAY_STATE_COLOR_VALUE_G: g = (parse_number(&seq[offset], 0) & 0xFF); state = DISPLAY_STATE_COLOR_VALUE_B; break;
-            case DISPLAY_STATE_COLOR_VALUE_B: {
-              target_foreground = foreground;
-              b = parse_number(&seq[offset], 0) & 0xFF;
-              target_color = rgb_color(r, g, b);
-              state = DISPLAY_STATE_NONE;
-            } break;
-          }
-          if (target_color.value != UNTARGETED_COLOR.value) {
-            if (view->cursor_styling_inversed)
-              target_foreground = !target_foreground;
-            if (target_foreground) {
-              uint8_t attributes = view->cursor_styling.foreground.attributes;
-              view->cursor_styling.foreground = target_color;
-              view->cursor_styling.foreground.attributes |= (attributes & ATTRIBUTE_STYLING_MASK);
-            } else
-              view->cursor_styling.background = target_color;
-          }
-          char* next = strchr(&seq[offset], ';');
-          if (!next)
-            break;
-          offset = (next - seq) + 1;
-        }
-        return 0;
-      } break;
-      case 'n': {
-        if (parse_number(&seq[2], 0) == 6) {
-          char buffer[12];
-          int length = snprintf(buffer, sizeof(buffer), "\x1B[%d;%dR", view->cursor_y, view->cursor_x);
-          terminal_input(terminal, buffer, length);
-        } else
-          unhandled = 1;
-      } break;
-      case 'r': {
-        int semicolon = -1;
-        for (semicolon = 2; semicolon < seq_end && seq[semicolon] != ';'; ++semicolon);
-        view->cursor_x = 0;
-        view->cursor_y = 0;
-        if (seq[semicolon] == ';') {
-          view->scrolling_region_start = min(max(parse_number(&seq[2], 1) - 1, 0), terminal->lines - 1);
-          view->scrolling_region_end = min(max(parse_number(&seq[semicolon+1], 1), 0), terminal->lines);
-        }
-      } break;
-      default: unhandled = 1; break;
-    }
-  } else if (type == ESCAPE_TYPE_OS) {
-    switch (seq[2]) {
-      case '0':
-        if (strlen(seq) >= 5 && seq[3] == ';') {
-          size_t len = min(sizeof(terminal->name) - 1, strlen(seq) - 4);
-          memcpy(terminal->name, &seq[4], len);
-          while (len > 0 && (terminal->name[len - 1] == '\a' || terminal->name[len - 1] == '\\' || terminal->name[len - 1] == '\x1B'))
-            --len;
-          terminal->name[len] = 0;
-        }
-      break;
-      case '4': {
-        int idx, r,g,b;
-        if (sscanf(&seq[3], ";%d;rgb:%x/%x/%x", &idx, &r, &g, &b) == 4) {
-          view->palette[idx] = rgb_color(r, g, b);
-        } else
-          unhandled = 1;
-      } break;
-      default: unhandled = 1; break;
-    }
-  } else if (type == ESCAPE_TYPE_FIXED_WIDTH) {
-    switch (seq[1]) {
-      case '#': {
-        switch (seq[2]) {
-          case '8':
-            for (int y = 0; y < terminal->lines; ++y) {
-              for (int x = 0; x < terminal->columns; ++x)
-                view->buffer[y * terminal->columns + x] = (buffer_char_t){ view->cursor_styling, 'E' };
-            }
-          break;
-          default: unhandled = 1; break;
-        }
-      } break;
-      case 'D': view->cursor_y = min(view->cursor_y + 1, terminal->lines - 1); break;
-      case 'E': view->cursor_y = min(view->cursor_y + 1, terminal->lines - 1); view->cursor_x = 0; break;
-      case '(':
-        switch (seq[2]) {
-          case '0': view->charset = CHARSET_DEC; break;
-          case 'B': view->charset = CHARSET_US; break;
-          default: view->charset = CHARSET_OTHER; break;
-        }
-      break;
-      case '=': view->keypad_keys_mode = KEYS_MODE_APPLICATION; break;
-      case '>': view->keypad_keys_mode = KEYS_MODE_NORMAL; break;
-      case 'M':
-        if (view->cursor_y == 0) {
-          memmove(&view->buffer[terminal->columns], &view->buffer[0], sizeof(buffer_char_t)*terminal->columns*(terminal->lines-1));
-          memset(&view->buffer[0], 0, sizeof(buffer_char_t)*terminal->columns);
-        } else {
-          --view->cursor_y;
-        }
-      break;
-      default: unhandled = 1; break;
-    }
-  }
-
-  if (unhandled) {
-    #ifdef LIBTERMINAL_DEBUG_ESCAPE
-      fprintf(stderr, "UNKNOWN ESCAPE SEQUENCE\n");
     #endif
-    return -1;
+  } else if (terminal->vt) {
+    vterm_input_write(terminal->vt, str, len);
   }
-  return 0;
 }
 
-
-static terminal_escape_type_e get_terminal_escape_type(char a, int* fixed_width) {
-  switch (a) {
-    case '[': return ESCAPE_TYPE_CSI;
-    case ']': return ESCAPE_TYPE_OS;
-    case 'D':
-    case 'E':
-    case 'H':
-    case 'M':
-    case 'Z':
-    case 'F':
-    case '>':
-    case '=':
-    case '7':
-    case '8':
-    case 'c':
-    case 'l':
-    case 'm':
-    case 'n':
-    case 'o':
-    case '|':
-    case '}':
-    case '~':
-      *fixed_width = 2;
-      return ESCAPE_TYPE_FIXED_WIDTH;
-    case ' ':
-    case '#':
-    case '%':
-    case '(':
-    case ')':
-    case '*':
-    case '+':
-      *fixed_width = 3;
-      return ESCAPE_TYPE_FIXED_WIDTH;
-  }
-  return ESCAPE_TYPE_UNKNOWN;
+// replies from libvterm (device attributes, cursor reports, mouse and focus events) go to the program
+static void on_output(const char* s, size_t len, void* user) {
+  terminal_t* terminal = user;
+  if (terminal->mode == MODE_PTY)
+    terminal_input(terminal, s, (int)len);
 }
 
-static terminal_escape_type_e parse_partial_sequence(const char* seq, int len, int* fixed_width) {
-  if (len == 0)
-    return ESCAPE_TYPE_NONE;
-  if (len == 1)
-    return ESCAPE_TYPE_OPEN;
-  return get_terminal_escape_type(seq[1], fixed_width);
-}
-
-static int translate_charset(charset_e charset, int codepoint) {
-  if (charset == CHARSET_DEC) {
-    switch (codepoint) {
-      case 0x5F: codepoint = ' '; break;
-      case 0x60: codepoint = 0x25C6; break;
-      case 0x61: codepoint = 0x2592; break;
-      case 0x62: codepoint = '\t'; break;
-      case 0x63: codepoint = '\f'; break;
-      case 0x64: codepoint = '\r'; break;
-      case 0x65: codepoint = '\n'; break;
-      case 0x66: codepoint = 0xB0; break;
-      case 0x67: codepoint = 0xB1; break;
-      case 0x68: codepoint = '\n'; break;
-      case 0x69: codepoint = '\v'; break;
-      case 0x6A: codepoint = 0x2518; break;
-      case 0x6B: codepoint = 0x2510; break;
-      case 0x6C: codepoint = 0x250C; break;
-      case 0x6D: codepoint = 0x2514; break;
-      case 0x6E: codepoint = 0x253C; break;
-      case 0x70: codepoint = 0x23BB; break;
-      case 0x71: codepoint = 0x2500; break;
-      case 0x72: codepoint = 0x23BC; break;
-      case 0x73: codepoint = 0x23BD; break;
-      case 0x74: codepoint = 0x251C; break;
-      case 0x75: codepoint = 0x2524; break;
-      case 0x76: codepoint = 0x2534; break;
-      case 0x77: codepoint = 0x252C; break;
-      case 0x78: codepoint = 0x2502; break;
-      case 0x79: codepoint = 0x2264; break;
-      case 0x7A: codepoint = 0x2265; break;
-      case 0x7B: codepoint = 0x03C0; break;
-      case 0x7C: codepoint = 0x2260; break;
-      case 0x7D: codepoint = 0x00A3; break;
-      case 0x7E: codepoint = 0x00B7; break;
-    }
-  }
-  return codepoint;
-}
-
-static int terminal_output(terminal_t* terminal, const char* str, int len) {
-  if (terminal->debug)  {
+static void terminal_output(terminal_t* terminal, const char* str, int len) {
+  if (terminal->debug) {
     FILE* file = fopen("terminal.log", "ab");
     if (file) {
       fwrite(str, sizeof(char), len, file);
       fclose(file);
     }
   }
-  unsigned int codepoint;
-  int total_shifts = 0;
-  int offset = 0;
-  int buffered_sequence_index = strlen(terminal->buffered_sequence);
-  view_t* view = &terminal->views[terminal->current_view];
-  int fixed_width = -1;
-  terminal_escape_type_e escape_type = parse_partial_sequence(terminal->buffered_sequence, buffered_sequence_index, &fixed_width);
-  while (offset < len) {
-    if (escape_type != ESCAPE_TYPE_NONE) {
-      terminal->buffered_sequence[buffered_sequence_index++] = str[offset];
-      escape_type = parse_partial_sequence(terminal->buffered_sequence, buffered_sequence_index, &fixed_width);
-      if (
-        (escape_type == ESCAPE_TYPE_CSI && buffered_sequence_index > 2 && str[offset] >= 0x40 && str[offset] <= 0x7E) ||
-        (escape_type == ESCAPE_TYPE_OS && ((offset < len - 1 && (str[offset+1] == '\a') || (offset < len - 2 && str[offset+1] == 0x1B && str[offset+2] == 0x5C)))) ||
-        (escape_type == ESCAPE_TYPE_UNKNOWN && str[offset] == 0x1B) ||
-        (escape_type == ESCAPE_TYPE_FIXED_WIDTH && buffered_sequence_index == fixed_width || str[offset] == 0x1B)
-      ) {
-        terminal->buffered_sequence[buffered_sequence_index++] = 0;
-        terminal_escape_sequence(terminal, escape_type, terminal->buffered_sequence);
-        view->last_graphical_character = 0;
-        view = &terminal->views[terminal->current_view];
-        buffered_sequence_index = 0;
-        terminal->buffered_sequence[0] = 0;
-        if (escape_type == ESCAPE_TYPE_OS) {
-          escape_type = ESCAPE_TYPE_NONE;
-          offset += str[offset+1] == 0x1B ? 2 : 1;
-        } else if (str[offset] == 0x1B && (escape_type == ESCAPE_TYPE_UNKNOWN || escape_type == ESCAPE_TYPE_FIXED_WIDTH)) {
-          escape_type = ESCAPE_TYPE_OPEN;
-          terminal->buffered_sequence[buffered_sequence_index++] = str[offset];
-        } else {
-          escape_type = ESCAPE_TYPE_NONE;
-        }
-      }
-      ++offset;
-    } else {
-      int end = (view->scrolling_region_end == -1 ? terminal->lines : view->scrolling_region_end);
-      offset += utf8_to_codepoint(&str[offset], &codepoint);
-      if (codepoint != '\e')
-        view->last_graphical_character = 0;
-      switch (codepoint) {
-        case 0x00:
-        case 0x01:
-        case 0x02:
-        case 0x03:
-        case 0x04:
-        case 0x05:
-        case 0x06:
-        case 0x07:
-        break;
-        case '\b': {
-          if (view->cursor_x)
-            --view->cursor_x;
-        } break;
-        case '\t': {
-          view->cursor_x = (view->cursor_x + view->tab_size) - ((view->cursor_x + view->tab_size) % view->tab_size);
-        } break;
-        case '\n': {
-          // So that we can copy text blocks properly.
-          if (view->cursor_y < (end - 1))
-            ++view->cursor_y;
-          else {
-            terminal_shift_buffer(terminal);
-            ++total_shifts;
-          }
-        } break;
-        case 0x0B:
-        case 0x0C:
-        break;
-        case '\r': {
-          view->cursor_x = 0;
-        } break;
-        case 0x0E:
-        case 0x0F:
-        case 0x11:
-        case 0x12:
-        case 0x13:
-        case 0x14:
-        case 0x15:
-        case 0x16:
-        case 0x17:
-        case 0x18:
-        case 0x19:
-        case 0x1A:
-          break;
-        case 0x1B: { // escape
-          terminal->buffered_sequence[0] = 0x1B;
-          escape_type = ESCAPE_TYPE_OPEN;
-          buffered_sequence_index = 1;
-        } break;
-        case 0x1C:
-        case 0x1D:
-        case 0x1E:
-        case 0x1F:
-          break;
-        default:
-          if (view->cursor_x >= terminal->columns) {
-            view->overflows[view->cursor_y] = 1;
-            view->cursor_x = 0;
-            if (view->cursor_y < (end - 1))
-              ++view->cursor_y;
-            else {
-              terminal_shift_buffer(terminal);
-              ++total_shifts;
-            }
-          }
-          codepoint = translate_charset(view->charset, codepoint);
-          view->buffer[view->cursor_y * terminal->columns + view->cursor_x] = (buffer_char_t){ view->cursor_styling, codepoint };
-          view->last_graphical_character = codepoint;
-          view->cursor_x++;
-        break;
-      }
-    }
-  }
-  terminal->buffered_sequence[buffered_sequence_index] = 0;
-  return total_shifts;
+  vterm_input_write(terminal->vt, str, len);
+  vterm_screen_flush_damage(terminal->screen);
 }
 
 #ifdef _WIN32
@@ -991,42 +366,43 @@ static int terminal_update(terminal_t* terminal, void (*callback)(char*, int, vo
   if (terminal->mode == MODE_DUMMY)
     return 0;
   char chunk[LIBTERMINAL_CHUNK_SIZE];
-  int len, at_least_one = 0;
+  int at_least_one = 0;
+  terminal->shifts = 0;
   #ifdef _WIN32
     WaitForSingleObject(terminal->nonblocking_buffer_mutex, INFINITE);
     if (terminal->nonblocking_buffer_length > 0) {
-      *total_shifts += terminal_output(terminal, terminal->nonblocking_buffer, terminal->nonblocking_buffer_length);
-      if (callback)
-        callback(chunk, terminal->nonblocking_buffer_length, data);
-      at_least_one = 1;
-    }
-    terminal->nonblocking_buffer_length = 0;
-    ReleaseMutex(terminal->nonblocking_buffer_mutex);
-    return at_least_one;
-  #else
-    int chunks_processed = 0;
-    do {
-      len = read(terminal->master, chunk, sizeof(chunk));
-      if (len == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
-        return at_least_one;
-      *total_shifts += terminal_output(terminal, chunk, len);
+      int len = terminal->nonblocking_buffer_length;
+      memcpy(chunk, terminal->nonblocking_buffer, len);
+      terminal->nonblocking_buffer_length = 0;
+      ReleaseMutex(terminal->nonblocking_buffer_mutex);
+      terminal_output(terminal, chunk, len);
       if (callback)
         callback(chunk, len, data);
       at_least_one = 1;
-    } while (len > 0 && chunks_processed++ < LIBTERMINAL_MAX_CHUNKS_PROCESSED);
+    } else
+      ReleaseMutex(terminal->nonblocking_buffer_mutex);
+  #else
+    for (int chunks = 0; chunks < LIBTERMINAL_MAX_CHUNKS_PROCESSED; ++chunks) {
+      int len = read(terminal->master, chunk, sizeof(chunk));
+      if (len <= 0)
+        break; // EAGAIN: nothing more for now; 0 / EIO: the program exited
+      terminal_output(terminal, chunk, len);
+      if (callback)
+        callback(chunk, len, data);
+      at_least_one = 1;
+    }
   #endif
-  return -1;
+  *total_shifts += terminal->shifts;
+  return at_least_one;
 }
 
 static int terminal_close(terminal_t* terminal) {
   terminal_clear_scrollback_buffer(terminal);
-  for (int i = 0; i < VIEW_MAX; ++i) {
-    if (terminal->views[i].buffer) {
-      free(terminal->views[i].buffer);
-      free(terminal->views[i].overflows);
-    }
-    terminal->views[i].buffer = NULL;
-    terminal->views[i].overflows = NULL;
+  if (terminal->vt) {
+    vterm_free(terminal->vt);
+    terminal->vt = NULL;
+    terminal->screen = NULL;
+    terminal->state = NULL;
   }
   if (terminal->mode == MODE_PTY) {
     #if _WIN32
@@ -1080,12 +456,21 @@ static void terminal_free(terminal_t* terminal) {
     if (terminal->pid)
       kill(terminal->pid, SIGKILL);
   #endif
+  free(terminal->scrollback);
   free(terminal);
 }
 
 static void terminal_resize(terminal_t* terminal, int columns, int lines) {
+  columns = max(columns, 1);
+  lines = max(lines, 1);
   if (terminal->columns == columns && terminal->lines == lines)
     return;
+  terminal->columns = columns;
+  terminal->lines = lines;
+  if (terminal->vt) {
+    vterm_set_size(terminal->vt, lines, columns);
+    vterm_screen_flush_damage(terminal->screen);
+  }
   if (terminal->mode == MODE_PTY) {
     #ifdef _WIN32
       COORD size = { columns, lines };
@@ -1095,35 +480,27 @@ static void terminal_resize(terminal_t* terminal, int columns, int lines) {
       ioctl(terminal->master, TIOCSWINSZ, &size);
     #endif
   }
-  for (int i = 0; i < VIEW_MAX; ++i) {
-    buffer_char_t* buffer = malloc(sizeof(buffer_char_t) * columns * lines);
-    memset(buffer, 0, sizeof(buffer_char_t) * columns * lines);
-    if (terminal->views[i].buffer) {
-      if (lines < terminal->lines && i == VIEW_NORMAL_BUFFER) {
-        for (int j = 0; j < max(0, (terminal->views[i].cursor_y+1) - lines); ++j)
-          terminal_shift_buffer(terminal);
-      }
-      int max_lines = min(terminal->lines, lines);
-      for (int y = 0; y < max_lines; ++y)
-        memcpy(&buffer[y*columns], &terminal->views[i].buffer[y*terminal->columns], min(terminal->columns, columns)*sizeof(buffer_char_t));
-      free(terminal->views[i].buffer);
-    }
-    terminal->views[i].buffer = buffer;
-    terminal->views[i].cursor_x = min(terminal->views[i].cursor_x, columns - 1);
-    terminal->views[i].cursor_y = min(terminal->views[i].cursor_y, lines - 1);
-    if (terminal->views[i].scrolling_region_start != -1 || terminal->views[i].scrolling_region_end != -1) {
-      terminal->views[i].scrolling_region_start = min(terminal->views[i].scrolling_region_start, lines - 1);
-      terminal->views[i].scrolling_region_end = min(terminal->views[i].scrolling_region_end, lines);
-    }
-    int* overflows = calloc(lines * sizeof(int), 1);
-    if (terminal->views[i].overflows) {
-      memcpy(overflows, terminal->views[i].overflows, min(terminal->lines, lines) * sizeof(int));
-      free(terminal->views[i].overflows);
-    }
-    terminal->views[i].overflows = overflows;
-  }
-  terminal->columns = columns;
-  terminal->lines = lines;
+  terminal->scrollback_position = min(terminal->scrollback_position, terminal->scrollback_count);
+}
+
+static int terminal_init_vterm(terminal_t* terminal, int columns, int lines, int scrollback_limit) {
+  terminal->columns = max(columns, 1);
+  terminal->lines = max(lines, 1);
+  terminal->scrollback_limit = max(scrollback_limit, 1);
+  terminal->scrollback = calloc(terminal->scrollback_limit, sizeof(scrollback_line_t*));
+  terminal->cursor_visible = 1;
+  terminal->vt = vterm_new(terminal->lines, terminal->columns);
+  if (!terminal->scrollback || !terminal->vt)
+    return -1;
+  vterm_set_utf8(terminal->vt, 1);
+  vterm_output_set_callback(terminal->vt, on_output, terminal);
+  terminal->state = vterm_obtain_state(terminal->vt);
+  terminal->screen = vterm_obtain_screen(terminal->vt);
+  vterm_screen_set_callbacks(terminal->screen, &screen_callbacks, terminal);
+  vterm_screen_enable_altscreen(terminal->screen, 1);
+  vterm_screen_enable_reflow(terminal->screen, true);
+  vterm_screen_reset(terminal->screen, 1);
+  return 0;
 }
 
 static char error_step[64];
@@ -1146,15 +523,6 @@ static int set_error_step(const char* step) { strncpy(error_step, step, sizeof(e
 
 static terminal_t* terminal_new(int columns, int lines, int scrollback_limit, const char* term_env, const char* pathname, const char** argv, const char** environment) {
   terminal_t* terminal = calloc(sizeof(terminal_t), 1);
-  for (int i = 0; i < VIEW_MAX; ++i) {
-    for (int j = 0; j < 256; ++j)
-      terminal->views[i].palette[j] = indexed_color(j);
-    terminal->views[i].scrolling_region_end = -1;
-    terminal->views[i].scrolling_region_start = -1;
-    terminal->views[i].cursor_styling = LIBTERMINAL_NO_STYLING;
-    terminal->views[i].tab_size = LIBTERMINAL_DEFAULT_TAB_SIZE;
-  }
-  terminal->scrollback_limit = scrollback_limit;
   terminal->mode = pathname && strcmp(pathname, "DUMMY") != 0 ? MODE_PTY : MODE_DUMMY;
   if (terminal->mode == MODE_PTY) {
     #ifdef _WIN32
@@ -1241,19 +609,26 @@ static terminal_t* terminal_new(int columns, int lines, int scrollback_limit, co
       fcntl(terminal->master, F_SETFL, flags | O_NONBLOCK);
     #endif
   }
-  terminal_resize(terminal, columns, lines);
+  if (terminal_init_vterm(terminal, columns, lines, scrollback_limit) && set_error_step("libvterm")) {
+    terminal_free(terminal);
+    return NULL;
+  }
+  #ifndef _WIN32
+    if (terminal->mode == MODE_PTY) {
+      struct winsize size = { .ws_row = terminal->lines, .ws_col = terminal->columns, .ws_xpixel = 0, .ws_ypixel = 0 };
+      ioctl(terminal->master, TIOCSWINSZ, &size);
+    }
+  #endif
   return terminal;
 }
 
 
-static void output_line(lua_State* L, buffer_char_t* start, buffer_char_t* end, int overflows) {
-  lua_newtable(L);
-  int block_size = 0;
-  int last_nonzero_codepoint = 0;
-  int group = 0;
+// Pushes one line as { fg, bg, text, fg, bg, text, ... }; text holds one codepoint per column
+// (a wide character is followed by a padding space) and the last run ends in "\n" unless the line wraps.
+static void output_line(lua_State* L, const cell_t* cells, int count, int continuation) {
   static char* text_buffer = NULL;
   static size_t text_buffer_size = 0;
-  size_t needed = (size_t)(end - start) * 4;
+  size_t needed = (size_t)count * 5 + 8;
   if (needed > text_buffer_size) {
     char* grown = realloc(text_buffer, needed);
     if (!grown)
@@ -1261,40 +636,81 @@ static void output_line(lua_State* L, buffer_char_t* start, buffer_char_t* end, 
     text_buffer = grown;
     text_buffer_size = needed;
   }
-  buffer_styling_t style = start->styling;
-  while (1) {
-    if (start >= end || start->styling.value != style.value) {
-      lua_pushnumber(L, (double)(
-        ((uint32_t)style.foreground.attributes << 24) |
-        ((uint32_t)style.foreground.r << 16) |
-        ((uint32_t)style.foreground.g << 8) |
-        ((uint32_t)style.foreground.b << 0)
-      ));
-      lua_rawseti(L, -2, ++group);
-      lua_pushnumber(L, (double)(
-        ((uint32_t)style.background.attributes << 24) |
-        ((uint32_t)style.background.r << 16) |
-        ((uint32_t)style.background.g << 8) |
-        ((uint32_t)style.background.b << 0)
-      ));
-      lua_rawseti(L, -2, ++group);
-      lua_pushlstring(L, text_buffer, start >= end ? last_nonzero_codepoint : block_size);
-      if (!overflows && start >= end) {
-        lua_pushliteral(L, "\n");
-        lua_concat(L, 2);
+  // trailing blanks with the default background are dropped
+  int end = count;
+  while (end > 0 && cells[end - 1].chars[0] == 0 && (cells[end - 1].reverse ? cells[end - 1].fg : cells[end - 1].bg) >> 24 == ATTRIBUTE_UNSET_COLOR && cells[end - 1].width != 0)
+    --end;
+  lua_newtable(L);
+  int group = 0, length = 0, run_open = 0;
+  uint32_t run_fg = 0, run_bg = 0;
+  for (int i = 0; i <= end; ++i) {
+    const cell_t* cell = i < end ? &cells[i] : NULL;
+    if (cell && cell->width == 0)
+      continue; // right half of a wide character
+    uint32_t fg = 0, bg = 0;
+    if (cell) {
+      fg = cell->fg; bg = cell->bg;
+      if (cell->reverse) {
+        uint32_t styling = fg & 0xFF000000 & ~((uint32_t)7 << 24);
+        uint32_t new_fg = (bg >> 24 & 7) == ATTRIBUTE_UNSET_COLOR ? ((uint32_t)ATTRIBUTE_INVERSE_COLOR << 24) : bg;
+        uint32_t new_bg = (fg >> 24 & 7) == ATTRIBUTE_UNSET_COLOR ? ((uint32_t)ATTRIBUTE_INVERSE_COLOR << 24) : (fg & ~((uint32_t)0xF8 << 24));
+        fg = new_fg | styling;
+        bg = new_bg;
       }
-      lua_rawseti(L, -2, ++group);
-      block_size = 0;
-      last_nonzero_codepoint = 0;
-      if (start >= end)
-        break;
-      style = start->styling;
+      if (cell->width == 2)
+        fg |= (uint32_t)ATTRIBUTE_WIDE << 24;
     }
-    block_size += codepoint_to_utf8(start->codepoint != 0 ? start->codepoint : ' ', &text_buffer[block_size]);
-    if (start->codepoint != 0)
-      last_nonzero_codepoint = block_size;
-    ++start;
+    int wide = cell && cell->width == 2;
+    // a wide character always gets a run of its own, so Lua can tell
+    if (run_open && (!cell || wide || fg != run_fg || bg != run_bg || (run_fg >> 24 & ATTRIBUTE_WIDE))) {
+      lua_pushnumber(L, (double)run_fg); lua_rawseti(L, -2, ++group);
+      lua_pushnumber(L, (double)run_bg); lua_rawseti(L, -2, ++group);
+      lua_pushlstring(L, text_buffer, length);
+      if (!cell && !continuation) { lua_pushliteral(L, "\n"); lua_concat(L, 2); }
+      lua_rawseti(L, -2, ++group);
+      run_open = 0;
+      length = 0;
+    }
+    if (!cell)
+      break;
+    if (!run_open) {
+      run_open = 1;
+      run_fg = fg;
+      run_bg = bg;
+    }
+    // one codepoint per column: Lua measures text by codepoints, so combining marks are left out
+    length += codepoint_to_utf8(cell->chars[0] ? cell->chars[0] : ' ', &text_buffer[length]);
+    if (wide)
+      text_buffer[length++] = ' ';
   }
+  if (group == 0) { // empty line
+    lua_pushnumber(L, 0); lua_rawseti(L, -2, ++group);
+    lua_pushnumber(L, 0); lua_rawseti(L, -2, ++group);
+    if (continuation) lua_pushliteral(L, ""); else lua_pushliteral(L, "\n");
+    lua_rawseti(L, -2, ++group);
+  }
+}
+
+static void output_screen_line(lua_State* L, terminal_t* terminal, int row) {
+  static cell_t* cells = NULL;
+  static int cells_size = 0;
+  if (terminal->columns > cells_size) {
+    cell_t* grown = realloc(cells, sizeof(cell_t) * terminal->columns);
+    if (!grown)
+      luaL_error(L, "out of memory");
+    cells = grown;
+    cells_size = terminal->columns;
+  }
+  for (int x = 0; x < terminal->columns; ++x) {
+    VTermScreenCell cell;
+    VTermPos pos = { .row = row, .col = x };
+    if (vterm_screen_get_cell(terminal->screen, pos, &cell))
+      cell_from_vterm(&cell, &cells[x]);
+    else
+      cells[x] = (cell_t){ { 0, 0 }, 0, 0, 1, 0 };
+  }
+  const VTermLineInfo* next = row + 1 < terminal->lines ? vterm_state_get_lineinfo(terminal->state, row + 1) : NULL;
+  output_line(L, cells, terminal->columns, next && next->continuation);
 }
 
 
@@ -1302,49 +718,34 @@ static terminal_t* lua_toterminal(lua_State* L, int index) {
   lua_getfield(L, index, "__terminal");
   terminal_t* terminal = (terminal_t*)lua_touserdata(L, -1);
   lua_pop(L, 1);
+  if (!terminal || !terminal->vt)
+    luaL_error(L, "terminal is closed");
   return terminal;
 }
 
+// lines([start [, end]]): rows from start to end inclusive; negative rows are scrollback (-1 is the newest)
 static int f_terminal_lines(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  int start = -terminal->scrollback_position;
+  int scrollback = terminal->alt_screen ? 0 : terminal->scrollback_position;
+  int start = -scrollback;
   if (lua_gettop(L) >= 2)
     start = (int) luaL_checknumber(L, 2);
   int end = start + terminal->lines;
   if (lua_gettop(L) >= 3)
     end = (int) luaL_checknumber(L, 3) + 1;
   lua_newtable(L);
-
   int total_lines = 0;
-  int remaining_lines = end - start;
-  view_t* view = &terminal->views[terminal->current_view];
-  if (terminal->current_view == VIEW_NORMAL_BUFFER && start < 0) {
-    int top_offset = terminal->scrollback_target_top_offset;
-    int offset = -start;
-    backbuffer_page_t* current_backbuffer = terminal_find_scrollback_page(terminal, terminal->scrollback_target, &offset, &top_offset);
-    int lines_into_buffer = top_offset - offset;
-    while (current_backbuffer) {
-      int* backbuffer_overflows = (int*)&current_backbuffer->buffer[LIBTERMINAL_BACKBUFFER_PAGE_LINES*current_backbuffer->columns];
-      for (int y = lines_into_buffer; y < current_backbuffer->line; ++y) {
-        output_line(L, &current_backbuffer->buffer[y * current_backbuffer->columns], &current_backbuffer->buffer[(y+1) * current_backbuffer->columns], backbuffer_overflows[y]);
-        lua_rawseti(L, -2, ++total_lines);
-        if (--remaining_lines == 0)
-          break;
-      }
-      if (remaining_lines == 0)
-        break;
-      current_backbuffer = current_backbuffer->next;
-      lines_into_buffer = 0;
-    }
-    start = 0;
-  }
-  if (remaining_lines > 0) {
-    start = max(start, 0);
-    remaining_lines = min(remaining_lines, terminal->lines - start);
-    for (int y = 0; y < remaining_lines; ++y) {
-      output_line(L, &view->buffer[(y + start) * terminal->columns], &view->buffer[(y + start + 1) * terminal->columns], view->overflows[y + start]);
-      lua_rawseti(L, -2, ++total_lines);
-    }
+  for (int row = start; row < end; ++row) {
+    if (row < 0) {
+      scrollback_line_t* line = terminal->alt_screen ? NULL : terminal_scrollback_line(terminal, -row - 1);
+      if (!line)
+        continue;
+      output_line(L, line->cells, line->columns, line->continuation);
+    } else if (row < terminal->lines) {
+      output_screen_line(L, terminal, row);
+    } else
+      break;
+    lua_rawseti(L, -2, ++total_lines);
   }
   return 1;
 }
@@ -1470,56 +871,14 @@ static int f_terminal_getenv(lua_State* L) {
 }
 #endif
 
-
-static int f_terminal_gc(lua_State* L) {
-  terminal_free(lua_toterminal(L, 1));
-  return 0;
-}
-
-static int f_terminal_close(lua_State* L) {
-  lua_pushinteger(L, terminal_close(lua_toterminal(L, 1)));
-  return 1;
-}
-
-static void chunk_update(char* buf, int len, void* L) {
-  lua_pushvalue(L, 2);
-  lua_pushlstring(L, buf, len);
-  lua_call(L, 1, 0);
-}
-static int f_terminal_update(lua_State* L){
-  int status, total_shifts = 0;
-  if (lua_type(L, 2) == LUA_TFUNCTION)
-    status = terminal_update(lua_toterminal(L, 1), chunk_update, L, &total_shifts);
-  else
-    status = terminal_update(lua_toterminal(L, 1), NULL, NULL, &total_shifts);
-  if (status != 0)
-    lua_pushinteger(L, total_shifts);
-  else
-    lua_pushboolean(L, 0);
-  return 1;
-}
-
-static int f_terminal_input(lua_State* L) {
-  size_t len;
-  const char* str = luaL_checklstring(L, 2, &len);
-  terminal_input(lua_toterminal(L, 1), str, (int)len);
-  return 0;
-}
-
-static int f_terminal_size(lua_State* L) {
-  terminal_t* terminal = lua_toterminal(L, 1);
-  if (lua_gettop(L) > 1) {
-    int x = (int) luaL_checknumber(L, 2), y = (int) luaL_checknumber(L, 3);
-    terminal_resize(terminal, x, y);
-  }
-  lua_pushinteger(L, terminal->columns);
-  lua_pushinteger(L, terminal->lines);
-  return 2;
-}
-
-
 static int f_terminal_exited(lua_State* L) {
-  terminal_t* terminal = lua_toterminal(L, 1);
+  lua_getfield(L, 1, "__terminal");
+  terminal_t* terminal = (terminal_t*)lua_touserdata(L, -1);
+  lua_pop(L, 1);
+  if (!terminal) {
+    lua_pushinteger(L, -1);
+    return 1;
+  }
   #if _WIN32
     DWORD exit_code;
     if (GetExitCodeProcess(terminal->process_information.hProcess, &exit_code) && exit_code != STILL_ACTIVE) {
@@ -1538,43 +897,98 @@ static int f_terminal_exited(lua_State* L) {
   return 1;
 }
 
+
+static int f_terminal_gc(lua_State* L) {
+  lua_getfield(L, 1, "__terminal");
+  terminal_t* terminal = (terminal_t*)lua_touserdata(L, -1);
+  if (terminal)
+    terminal_free(terminal);
+  lua_pushnil(L);
+  lua_setfield(L, 1, "__terminal");
+  return 0;
+}
+
+static int f_terminal_close(lua_State* L) {
+  lua_getfield(L, 1, "__terminal");
+  terminal_t* terminal = (terminal_t*)lua_touserdata(L, -1);
+  lua_pushinteger(L, terminal ? terminal_close(terminal) : 0);
+  return 1;
+}
+
+static void chunk_update(char* buf, int len, void* L) {
+  lua_pushvalue(L, 2);
+  lua_pushlstring(L, buf, len);
+  lua_call(L, 1, 0);
+}
+
+// update([callback]): reads pending output; returns the lines pushed into the scrollback, or false if nothing arrived
+static int f_terminal_update(lua_State* L) {
+  int status, total_shifts = 0;
+  terminal_t* terminal = lua_toterminal(L, 1);
+  if (lua_type(L, 2) == LUA_TFUNCTION)
+    status = terminal_update(terminal, chunk_update, L, &total_shifts);
+  else
+    status = terminal_update(terminal, NULL, NULL, &total_shifts);
+  if (status != 0)
+    lua_pushinteger(L, total_shifts);
+  else
+    lua_pushboolean(L, 0);
+  return 1;
+}
+
+static int f_terminal_input(lua_State* L) {
+  size_t len;
+  terminal_t* terminal = lua_toterminal(L, 1);
+  const char* str = luaL_checklstring(L, 2, &len);
+  terminal_input(terminal, str, (int)len);
+  if (terminal->mode == MODE_DUMMY)
+    vterm_screen_flush_damage(terminal->screen);
+  return 0;
+}
+
+static int f_terminal_size(lua_State* L) {
+  terminal_t* terminal = lua_toterminal(L, 1);
+  if (lua_gettop(L) > 1) {
+    int x = (int) luaL_checknumber(L, 2), y = (int) luaL_checknumber(L, 3);
+    terminal_resize(terminal, x, y);
+  }
+  lua_pushinteger(L, terminal->columns);
+  lua_pushinteger(L, terminal->lines);
+  return 2;
+}
+
 static int f_terminal_cursor(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  lua_pushinteger(L, terminal->views[terminal->current_view].cursor_x);
-  lua_pushinteger(L, terminal->views[terminal->current_view].cursor_y);
-  switch (terminal->views[terminal->current_view].cursor_mode) {
-    case CURSOR_SOLID: lua_pushliteral(L, "solid"); break;
-    case CURSOR_HIDDEN: lua_pushliteral(L, "hidden"); break;
-    case CURSOR_BLINKING: lua_pushliteral(L, "blinking"); break;
-  }
+  lua_pushinteger(L, terminal->cursor_x);
+  lua_pushinteger(L, terminal->cursor_y);
+  if (!terminal->cursor_visible)
+    lua_pushliteral(L, "hidden");
+  else if (terminal->cursor_blink)
+    lua_pushliteral(L, "blinking");
+  else
+    lua_pushliteral(L, "solid");
   return 3;
 }
 
 static int f_terminal_cursor_keys_mode(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  switch (terminal->views[terminal->current_view].cursor_keys_mode) {
-    case KEYS_MODE_NORMAL: lua_pushliteral(L, "normal"); break;
-    case KEYS_MODE_APPLICATION: lua_pushliteral(L, "application"); break;
-  }
+  lua_pushstring(L, terminal->state->mode.cursor ? "application" : "normal");
   return 1;
 }
 
 static int f_terminal_keypad_keys_mode(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  switch (terminal->views[terminal->current_view].keypad_keys_mode) {
-    case KEYS_MODE_NORMAL: lua_pushliteral(L, "normal"); break;
-    case KEYS_MODE_APPLICATION: lua_pushliteral(L, "application"); break;
-  }
+  lua_pushstring(L, terminal->state->mode.keypad ? "application" : "normal");
   return 1;
 }
 
 static int f_terminal_scrollback(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  if (terminal->current_view == VIEW_NORMAL_BUFFER) {
+  if (!terminal->alt_screen) {
     if (lua_gettop(L) >= 2)
       terminal_scrollback(terminal, (int) luaL_checknumber(L, 2));
     lua_pushinteger(L, terminal->scrollback_position);
-    lua_pushinteger(L, terminal->scrollback_total_lines);
+    lua_pushinteger(L, terminal->scrollback_count);
   } else {
     lua_pushinteger(L, 0);
     lua_pushinteger(L, 0);
@@ -1582,16 +996,19 @@ static int f_terminal_scrollback(lua_State* L) {
   return 2;
 }
 
+// libvterm only reports focus when the program asked for it (DEC mode 1004)
 static int f_terminal_focused(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  if (terminal->reporting_focus)
-    terminal_input(terminal, lua_toboolean(L, 2) ? "\x1B[I" : "\x1B[O", 3);
+  if (lua_toboolean(L, 2))
+    vterm_state_focus_in(terminal->state);
+  else
+    vterm_state_focus_out(terminal->state);
   return 0;
 }
 
 static int f_terminal_paste_mode(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  lua_pushstring(L, terminal->paste_mode == PASTE_BRACKETED ? "bracketed" : "normal");
+  lua_pushstring(L, terminal->state->mode.bracketpaste ? "bracketed" : "normal");
   return 1;
 }
 
@@ -1607,22 +1024,39 @@ static int f_terminal_name(lua_State* L) {
 static int f_terminal_clear(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
   terminal_clear_scrollback_buffer(terminal);
-  view_t* view = &terminal->views[terminal->current_view];
-  memset(view->buffer, 0, sizeof(buffer_char_t) * (terminal->columns * terminal->lines));
-  view->cursor_x = 0;
-  view->cursor_y = 0;
+  const char* clear = "\x1B[H\x1B[2J";
+  vterm_input_write(terminal->vt, clear, strlen(clear));
+  vterm_screen_flush_damage(terminal->screen);
   return 0;
 }
 
 static int f_terminal_mouse_tracking_mode(lua_State* L) {
   terminal_t* terminal = lua_toterminal(L, 1);
-  switch (terminal->views[terminal->current_view].mouse_tracking_mode) {
-    case MOUSE_TRACKING_NONE: lua_pushnil(L); break;
-    case MOUSE_TRACKING_X10: lua_pushliteral(L, "x10"); break;
-    case MOUSE_TRACKING_NORMAL: lua_pushliteral(L, "normal"); break;
-    case MOUSE_TRACKING_SGR: lua_pushliteral(L, "sgr"); break;
+  switch (terminal->mouse_mode) {
+    case VTERM_PROP_MOUSE_CLICK: lua_pushliteral(L, "click"); break;
+    case VTERM_PROP_MOUSE_DRAG: lua_pushliteral(L, "drag"); break;
+    case VTERM_PROP_MOUSE_MOVE: lua_pushliteral(L, "move"); break;
+    default: lua_pushnil(L); break;
   }
   return 1;
+}
+
+static int f_terminal_mouse(lua_State* L) {
+  terminal_t* terminal = lua_toterminal(L, 1);
+  const char* action = luaL_checkstring(L, 2);
+  int button = (int) luaL_optnumber(L, 3, 0);
+  int col = (int) luaL_checknumber(L, 4), row = (int) luaL_checknumber(L, 5);
+  const char* mods = luaL_optstring(L, 6, "");
+  VTermModifier mod = VTERM_MOD_NONE;
+  if (strstr(mods, "shift")) mod |= VTERM_MOD_SHIFT;
+  if (strstr(mods, "alt")) mod |= VTERM_MOD_ALT;
+  if (strstr(mods, "ctrl")) mod |= VTERM_MOD_CTRL;
+  col = max(0, min(col, terminal->columns - 1));
+  row = max(0, min(row, terminal->lines - 1));
+  vterm_mouse_move(terminal->vt, row, col, mod);
+  if (strcmp(action, "press") == 0 || strcmp(action, "release") == 0)
+    vterm_mouse_button(terminal->vt, button, strcmp(action, "press") == 0, mod);
+  return 0;
 }
 
 static const luaL_Reg terminal_api[] = {
@@ -1640,6 +1074,7 @@ static const luaL_Reg terminal_api[] = {
   #endif
   { "cursor",              f_terminal_cursor                 },
   { "focused",             f_terminal_focused                },
+  { "mouse",               f_terminal_mouse                  },
   { "mouse_tracking_mode", f_terminal_mouse_tracking_mode    },
   { "cursor_keys_mode",    f_terminal_cursor_keys_mode       },
   { "keypad_keys_mode",    f_terminal_keypad_keys_mode       },
@@ -1651,7 +1086,7 @@ static const luaL_Reg terminal_api[] = {
 
 
 #ifndef LIBTERMINAL_VERSION
-  #define LIBTERMINAL_VERSION "1.09-byte"
+  #define LIBTERMINAL_VERSION "2.0-byte-libvterm"
 #endif
 
 int luaopen_libterminal(lua_State* L) {
