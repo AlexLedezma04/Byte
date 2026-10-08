@@ -131,6 +131,11 @@ function CommandView:exit(submitted, inexplicit)
 end
 
 
+function CommandView:get_h_scroll_limit()
+  return 0 -- single line: no sideways scrolling or scrollbar
+end
+
+
 function CommandView:get_gutter_width()
   return self.gutter_width
 end

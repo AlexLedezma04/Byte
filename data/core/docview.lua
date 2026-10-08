@@ -213,7 +213,82 @@ local function mouse_selection(doc, clicks, line1, col1, line2, col2)
 end
 
 
+-- horizontal scrolling
+function DocView:get_max_line_width()
+  local font = self:get_font()
+  local change_id = self.doc:get_change_id()
+  if self.max_width_font ~= font then
+    self.max_width_font, self.max_width, self.max_width_change_id = font, 0, nil
+  end
+  if self.max_width_change_id ~= change_id then
+    self.max_width_change_id = change_id
+    local line1, _, line2 = self.doc:get_selection(true)
+    for i = line1, line2 do
+      self.max_width = math.max(self.max_width, font:get_width(self.doc.lines[i] or ""))
+    end
+    core.add_thread(function()
+      local max = 0
+      for i, line in ipairs(self.doc.lines) do
+        max = math.max(max, font:get_width(line))
+        if i % 2000 == 0 then
+          coroutine.yield()
+          if self.max_width_change_id ~= change_id or self.max_width_font ~= font then return end
+        end
+      end
+      self.max_width = max
+      core.redraw = true
+    end, self)
+  end
+  return self.max_width
+end
+
+
+-- how far the text can scroll sideways (0 when everything fits)
+function DocView:get_h_scroll_limit()
+  local visible = self.size.x - self:get_gutter_width() - style.scrollbar_size
+  local margin = self:get_font():get_width(" ") * 4
+  return math.max(0, self:get_max_line_width() + margin - visible)
+end
+
+
+function DocView:get_h_scrollbar_rect()
+  local limit = self:get_h_scroll_limit()
+  if limit <= 0 then return 0, 0, 0, 0 end
+  local gw = self:get_gutter_width()
+  local track = self.size.x - gw - style.scrollbar_size
+  local w = math.max(20, track * track / (track + limit))
+  local x = self.position.x + gw + (track - w) * (self.scroll.x / limit)
+  local h = style.scrollbar_size
+  return x, self.position.y + self.size.y - h, w, h
+end
+
+
+function DocView:h_scrollbar_overlaps_point(x, y)
+  local sx, sy, sw, sh = self:get_h_scrollbar_rect()
+  return sw > 0 and x >= sx and x < sx + sw and y >= sy - sh * 3 and y < sy + sh
+end
+
+
+function DocView:on_mouse_wheel(y, x)
+  x = x or 0
+  if keymap.modkeys["shift"] and x == 0 then
+    x, y = -y, 0
+  end
+  if y ~= 0 then
+    DocView.super.on_mouse_wheel(self, y)
+  end
+  if x ~= 0 then
+    self.scroll.to.x = common.clamp(self.scroll.to.x + x * config.mouse_wheel_scroll,
+      0, self:get_h_scroll_limit())
+  end
+end
+
+
 function DocView:on_mouse_pressed(button, x, y, clicks)
+  if button == "left" and self:h_scrollbar_overlaps_point(x, y) then
+    self.dragging_h_scrollbar = true
+    return
+  end
   local caught = DocView.super.on_mouse_pressed(self, button, x, y, clicks)
   if caught then
     return
@@ -233,10 +308,23 @@ function DocView:on_mouse_pressed(button, x, y, clicks)
 end
 
 
-function DocView:on_mouse_moved(x, y, ...)
-  DocView.super.on_mouse_moved(self, x, y, ...)
+function DocView:on_mouse_moved(x, y, dx, ...)
+  if self.dragging_h_scrollbar then
+    local limit = self:get_h_scroll_limit()
+    local _, _, w = self:get_h_scrollbar_rect()
+    local track = self.size.x - self:get_gutter_width() - style.scrollbar_size
+    if track > w then
+      self.scroll.to.x = common.clamp(self.scroll.to.x + dx * limit / (track - w), 0, limit)
+      self.scroll.x = self.scroll.to.x
+    end
+    self.cursor = "arrow"
+    return
+  end
+  self.hovered_h_scrollbar = self:h_scrollbar_overlaps_point(x, y)
+  DocView.super.on_mouse_moved(self, x, y, dx, ...)
 
-  if self:scrollbar_overlaps_point(x, y) or self.dragging_scrollbar then
+  if self:scrollbar_overlaps_point(x, y) or self.dragging_scrollbar
+  or self.hovered_h_scrollbar then
     self.cursor = "arrow"
   else
     self.cursor = "ibeam"
@@ -252,6 +340,7 @@ end
 
 
 function DocView:on_mouse_released(button)
+  self.dragging_h_scrollbar = false
   DocView.super.on_mouse_released(self, button)
   self.mouse_selecting = nil
 end
@@ -282,6 +371,9 @@ function DocView:update()
       core.redraw = true
     end
   end
+
+  local limit = self:get_h_scroll_limit()
+  if self.scroll.to.x > limit then self.scroll.to.x = limit end
 
   DocView.super.update(self)
 end
@@ -377,6 +469,11 @@ function DocView:draw()
   core.pop_clip_rect()
 
   self:draw_scrollbar()
+  local hx, hy, hw, hh = self:get_h_scrollbar_rect()
+  if hw > 0 then
+    local highlight = self.hovered_h_scrollbar or self.dragging_h_scrollbar
+    renderer.draw_rect(hx, hy, hw, hh, highlight and style.scrollbar2 or style.scrollbar)
+  end
 end
 
 

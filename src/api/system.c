@@ -122,7 +122,8 @@ top:
     case SDL_MOUSEWHEEL:
       lua_pushstring(L, "mousewheel");
       lua_pushnumber(L, e.wheel.y);
-      return 2;
+      lua_pushnumber(L, e.wheel.x);
+      return 3;
 
     default:
       goto top;
