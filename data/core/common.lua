@@ -126,6 +126,35 @@ function common.draw_text(font, color, text, align, x,y,w,h)
 end
 
 
+-- last component of a path: "/a/b/file.txt" -> "file.txt"
+function common.basename(path)
+  return path:match("[^/\\]+$") or path
+end
+
+
+-- quotes a string as one argument for the platform's shell
+function common.shell_quote(s)
+  if PATHSEP == "\\" then
+    return '"' .. s:gsub('"', '\\"') .. '"'
+  end
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+
+function common.point_in_rect(px, py, x, y, w, h)
+  return px >= x and py >= y and px < x + w and py < y + h
+end
+
+
+-- shallow copy of `a` with the keys of `b` on top (as in Lite XL)
+function common.merge(a, b)
+  local t = {}
+  if type(a) == "table" then for k, v in pairs(a) do t[k] = v end end
+  if type(b) == "table" then for k, v in pairs(b) do t[k] = v end end
+  return t
+end
+
+
 function common.bench(name, fn, ...)
   local start = system.get_time()
   local res = fn(...)

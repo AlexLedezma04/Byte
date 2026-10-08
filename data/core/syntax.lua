@@ -20,8 +20,11 @@ local function find(string, field)
   end
 end
 
+
 function syntax.get(filename, header)
+  local basename = common.basename(filename)
   return find(filename, "files")
+      or (basename ~= filename and find(basename, "files"))
       or find(header, "headers")
       or plain_text_syntax
 end

@@ -17,4 +17,6 @@ config.indent_size = 2
 config.tab_type = "soft"
 config.line_limit = 80
 
+config.plugins = {}
+
 return config
