@@ -22,7 +22,7 @@ local default_shell = os.getenv("SHELL")
 local defaults = {
   shell = default_shell,
   arguments = {},
-  environment = {},
+  environment = { COLORTERM = "truecolor" },
   term = "xterm-256color",
   scrollback_limit = 10000,
   drawer_height = 250 * SCALE,
@@ -164,6 +164,10 @@ local function decode(v, target, bright)
   return target == "fg" and foreground() or background(), bold
 end
 
+local function is_wide(v)
+  return math.floor(v / 16777216 / 64) % 2 == 1
+end
+
 -- contrast-adjusted foreground per (background, foreground) color value;
 -- number keys, so the per-frame lookup allocates nothing
 local contrast_cache = {}
@@ -194,6 +198,8 @@ function TerminalView:new(drawer)
   self.focused = false
   self.modified_since_last_focus = false
   self.blink_start = system.get_time()
+  self.sessions = {}
+  self.header_items = {}
   if drawer then
     self.visible = false
     self.height = cfg.drawer_height
@@ -210,9 +216,19 @@ function TerminalView:get_cell_size()
   return font():get_width("W"), font():get_height()
 end
 
+-- the drawer has a header with a tab per shell; tab views use the editor's tabs
+function TerminalView:header_height()
+  if not self.drawer then return 0 end
+  return style.font:get_height() + style.padding.y
+end
+
+function TerminalView:content_y()
+  return self.position.y + self:header_height()
+end
+
 function TerminalView:get_grid_size()
   local cw, lh = self:get_cell_size()
-  local h = self.drawer and self.height or self.size.y
+  local h = (self.drawer and self.height or self.size.y) - self:header_height()
   local cols = math.floor((self.size.x - cfg.padding.x * 2 - style.scrollbar_size) / cw)
   local lines = math.floor((h - cfg.padding.y * 2) / lh)
   return math.max(cols, 1), math.max(lines, 1)
@@ -229,18 +245,62 @@ function TerminalView:spawn()
     env = table.concat(t, "\0") .. "\0\0"
   end
   self.columns, self.lines = self:get_grid_size()
-  self.terminal = libterminal.new(self.columns, self.lines, cfg.scrollback_limit, cfg.term,
+  local term = libterminal.new(self.columns, self.lines, cfg.scrollback_limit, cfg.term,
     cfg.shell, cfg.arguments, env, cfg.debug)
-  self.selection = nil
+  local first = #self.sessions == 0
+  table.insert(self.sessions, term)
+  self:switch_session(#self.sessions)
+  if not first then return end
 
-  -- poll the shell; weak so a closed view can be collected
+  -- poll every shell; weak so a closed view can be collected
+  self.poll_generation = (self.poll_generation or 0) + 1
+  local generation = self.poll_generation
   local weak = setmetatable({ view = self }, { __mode = "v" })
   core.add_thread(function()
-    while weak.view and weak.view.terminal do
-      if weak.view:poll() then core.redraw = true end
+    while weak.view and weak.view.terminal and weak.view.poll_generation == generation do
+      local view = weak.view
+      for _, s in ipairs(view.sessions) do
+        if s == view.terminal then
+          if view:poll() then core.redraw = true end
+        elseif s:update() then
+          view.unread = view.unread or {}
+          view.unread[s] = true
+          core.redraw = true
+        end
+      end
+      view = nil
       coroutine.yield(1 / config.fps)
     end
   end, self)
+end
+
+function TerminalView:switch_session(index)
+  local term = self.sessions[index]
+  if not term then return end
+  self.terminal = term
+  self.selection = nil
+  if self.unread then self.unread[term] = nil end
+  local cols, rows = self:get_grid_size()
+  local c, l = term:size()
+  if c ~= cols or l ~= rows then term:size(cols, rows) end
+  self.columns, self.lines = cols, rows
+  self.blink_start = system.get_time()
+  core.redraw = true
+end
+
+-- closes one shell; the view goes away (or the drawer hides) with the last one
+function TerminalView:close_session(index)
+  local term = self.sessions[index]
+  if not term then return end
+  term:close()
+  table.remove(self.sessions, index)
+  if self.unread then self.unread[term] = nil end
+  if #self.sessions == 0 then
+    self:shell_exited()
+  elseif term == self.terminal then
+    self:switch_session(math.min(index, #self.sessions))
+  end
+  core.redraw = true
 end
 
 -- reads pending shell output; returns true if anything changed
@@ -259,6 +319,9 @@ function TerminalView:poll()
 end
 
 function TerminalView:shell_exited()
+  for _, s in ipairs(self.sessions) do s:close() end
+  self.sessions = {}
+  self.unread = nil
   self.terminal = nil
   self.selection = nil
   if self.drawer then
@@ -281,7 +344,8 @@ function TerminalView:close_tab()
 end
 
 function TerminalView:try_close(do_close)
-  if self.terminal then self.terminal:close() end
+  for _, s in ipairs(self.sessions) do s:close() end
+  self.sessions = {}
   self.terminal = nil
   do_close()
 end
@@ -301,18 +365,20 @@ function TerminalView:update()
     self:spawn()
   end
 
-  if self.terminal then
-    local exited = self.terminal:exited()
-    if exited ~= false then
-      self:shell_exited()
-      return
+  -- drop shells that exited (typed `exit`, or closed from the header)
+  for i = #self.sessions, 1, -1 do
+    if self.sessions[i]:exited() ~= false then
+      self:close_session(i)
+      if not self.terminal then return end
     end
+  end
 
+  if self.terminal then
     -- resize the grid
     local cols, lines = self:get_grid_size()
     if shown and (cols ~= self.columns or lines ~= self.lines) then
       self.columns, self.lines = cols, lines
-      self.terminal:size(cols, lines)
+      for _, s in ipairs(self.sessions) do s:size(cols, lines) end
     end
 
     -- focus reporting
@@ -355,7 +421,7 @@ function TerminalView:update()
   end
 
   self.cursor = (self.terminal and self.terminal:mouse_tracking_mode()) and "arrow" or "ibeam"
-  if self.hovered_scrollbar or self.dragging_scrollbar then self.cursor = "arrow" end
+  if self.hovered_scrollbar or self.dragging_scrollbar or self.over_header then self.cursor = "arrow" end
 end
 
 function TerminalView:get_scrollable_size()
@@ -412,6 +478,86 @@ local function split_sections(text, length, offset, idx, sel, fg, bg, cursor_x)
   return sections
 end
 
+-- Block elements and light box drawing are drawn as rectangles.
+local blocks = {
+  [0x2580] = { { 0, 0, 8, 4 } }, [0x2588] = { { 0, 0, 8, 8 } }, [0x2590] = { { 4, 0, 4, 8 } },
+  [0x2594] = { { 0, 0, 8, 1 } }, [0x2595] = { { 7, 0, 1, 8 } },
+  [0x2596] = { { 0, 4, 4, 4 } }, [0x2597] = { { 4, 4, 4, 4 } }, [0x2598] = { { 0, 0, 4, 4 } },
+  [0x259D] = { { 4, 0, 4, 4 } },
+  [0x2599] = { { 0, 0, 4, 8 }, { 4, 4, 4, 4 } }, [0x259A] = { { 0, 0, 4, 4 }, { 4, 4, 4, 4 } },
+  [0x259B] = { { 0, 0, 8, 4 }, { 0, 4, 4, 4 } }, [0x259C] = { { 0, 0, 8, 4 }, { 4, 4, 4, 4 } },
+  [0x259E] = { { 4, 0, 4, 4 }, { 0, 4, 4, 4 } }, [0x259F] = { { 4, 0, 4, 4 }, { 0, 4, 8, 4 } },
+}
+for n = 1, 7 do
+  blocks[0x2580 + n] = { { 0, 8 - n, 8, n } } -- lower n eighths
+  blocks[0x2588 + n] = { { 0, 0, 8 - n, 8 } } -- left (8 - n) eighths
+end
+local shades = { [0x2591] = 0.25, [0x2592] = 0.5, [0x2593] = 0.75 }
+-- light lines: which arms (left, right, up, down) reach the cell edges
+local box = {
+  [0x2500] = "lr", [0x2502] = "ud", [0x250C] = "rd", [0x2510] = "ld", [0x2514] = "ru", [0x2518] = "lu",
+  [0x251C] = "rud", [0x2524] = "lud", [0x252C] = "lrd", [0x2534] = "lru", [0x253C] = "lrud",
+  [0x256D] = "rd", [0x256E] = "ld", [0x256F] = "lu", [0x2570] = "ru", [0x2574] = "l", [0x2575] = "u",
+  [0x2576] = "r", [0x2577] = "d",
+}
+
+local function draw_special(cp, x, y, cw, lh, color)
+  local function rect(x0, y0, x1, y1)
+    x0, y0, x1, y1 = math.floor(x0 + 0.5), math.floor(y0 + 0.5), math.floor(x1 + 0.5), math.floor(y1 + 0.5)
+    if x1 > x0 and y1 > y0 then renderer.draw_rect(x0, y0, x1 - x0, y1 - y0, color) end
+  end
+  local b = blocks[cp]
+  if b then
+    for _, q in ipairs(b) do
+      rect(x + q[1] * cw / 8, y + q[2] * lh / 8, x + (q[1] + q[3]) * cw / 8, y + (q[2] + q[4]) * lh / 8)
+    end
+    return true
+  end
+  if shades[cp] then
+    renderer.draw_rect(x, y, cw, lh, { color[1], color[2], color[3], (color[4] or 255) * shades[cp] })
+    return true
+  end
+  local arms = box[cp]
+  if arms then
+    local t = math.max(1, math.floor(SCALE + 0.5))
+    local cx, cy = math.floor(x + cw / 2), math.floor(y + lh / 2)
+    if arms:find("l") then rect(x, cy, cx + t, cy + t) end
+    if arms:find("r") then rect(cx, cy, x + cw, cy + t) end
+    if arms:find("u") then rect(cx, y, cx + t, cy + t) end
+    if arms:find("d") then rect(cx, cy, cx + t, y + lh) end
+    return true
+  end
+  return false
+end
+
+-- draws text one column per codepoint: ASCII in batches, everything else at its own cell
+local function draw_cells(f, text, x, y, cw, lh, color, bold)
+  local batch, batch_x = {}, x
+  local function flush()
+    if #batch > 0 then
+      local t = table.concat(batch)
+      renderer.draw_text(f, t, batch_x, y, color)
+      if bold then renderer.draw_text(f, t, batch_x + math.max(1, math.floor(SCALE)), y, color) end
+      batch = {}
+    end
+  end
+  for ch in text:gmatch("[^\128-\191][\128-\191]*") do
+    if #ch == 1 then
+      if #batch == 0 then batch_x = x end
+      batch[#batch + 1] = ch
+    else
+      flush()
+      local cp = utf8.codepoint(ch)
+      if not draw_special(cp, x, y, cw, lh, color) then
+        renderer.draw_text(f, ch, x, y, color)
+        if bold then renderer.draw_text(f, ch, x + math.max(1, math.floor(SCALE)), y, color) end
+      end
+    end
+    x = x + cw
+  end
+  flush()
+end
+
 function TerminalView:draw()
   self:draw_background(background())
   if not self.terminal or self.size.y < 1 then return end
@@ -424,8 +570,9 @@ function TerminalView:draw()
   local sel = self:sorted_selection()
   local default_bg = background()
 
-  core.push_clip_rect(self.position.x, self.position.y, self.size.x, self.size.y)
-  local y = self.position.y + cfg.padding.y
+  local top = self:content_y()
+  core.push_clip_rect(self.position.x, top, self.size.x, self.position.y + self.size.y - top)
+  local y = top + cfg.padding.y
   for line_idx, line in ipairs(self.terminal:lines()) do
     if y > self.position.y + self.size.y then break end
     local x = self.position.x + cfg.padding.x
@@ -434,6 +581,9 @@ function TerminalView:draw()
     local cx = show_cursor and line_idx - 1 == cursor_y and cursor_x or nil
     for i = 1, #line, 3 do
       local fg, bg = cell_colors(line[i], line[i + 1])
+      local attributes = math.floor(line[i] / 16777216)
+      local bold = math.floor(attributes / 8) % 2 == 1
+      local underline = math.floor(attributes / 32) % 2 == 1
       local text = line[i + 2]:gsub("\n$", "")
       local length = ulen(text)
       if cx and i + 2 >= #line and cx >= offset + length then
@@ -445,7 +595,8 @@ function TerminalView:draw()
         if stext ~= "" then
           local w = ulen(stext) * cw
           if sbg ~= default_bg then renderer.draw_rect(x, y, w, lh, sbg) end
-          renderer.draw_text(f, stext, x, y, sfg)
+          draw_cells(f, stext, x, y, cw, lh, sfg, bold)
+          if underline then renderer.draw_rect(x, y + lh - math.max(1, math.floor(SCALE + 0.5)) - 1, w, math.max(1, math.floor(SCALE + 0.5)), sfg) end
           x = x + w
         end
       end
@@ -455,13 +606,78 @@ function TerminalView:draw()
   end
   core.pop_clip_rect()
   self:draw_scrollbar()
+  self:draw_header()
+end
+
+-- header: one tab per shell with a close button, then a button for a new shell.
+function TerminalView:draw_header()
+  local h = self:header_height()
+  self.header_items = {}
+  if h == 0 then return end
+  local x, y = self.position.x, self.position.y
+  renderer.draw_rect(x, y, self.size.x, h, style.background2)
+  renderer.draw_rect(x, y + h - style.divider_size, self.size.x, style.divider_size, style.divider)
+  local f, pad = style.font, style.padding.x
+  local close_w = f:get_width("×")
+  local hovered = self.hovered_header_item
+  local function is_hovered(kind, index)
+    return hovered and hovered.kind == kind and hovered.index == index
+  end
+  local tx = x
+  for i, term in ipairs(self.sessions) do
+    local label = i .. ": " .. (term:name() or "Terminal")
+    if self.unread and self.unread[term] then label = "* " .. label end
+    local w = pad + f:get_width(label) + pad / 2 + close_w + pad
+    local active = term == self.terminal
+    if active then
+      renderer.draw_rect(tx, y, w, h - style.divider_size, background())
+      renderer.draw_rect(tx, y, w, style.divider_size * 2, style.caret)
+    end
+    local text_y = y + (h - f:get_height()) / 2
+    renderer.draw_text(f, label, tx + pad, text_y, active and style.accent or style.text)
+    local cx = tx + w - pad - close_w
+    renderer.draw_text(f, "×", cx, text_y, is_hovered("close", i) and style.accent or style.dim)
+    table.insert(self.header_items, { kind = "tab", index = i, x = tx, w = w - pad - close_w })
+    table.insert(self.header_items, { kind = "close", index = i, x = cx - pad / 2, w = close_w + pad })
+    renderer.draw_rect(tx + w, y + style.padding.y / 2, style.divider_size, h - style.padding.y, style.divider)
+    tx = tx + w + style.divider_size
+  end
+  local plus_w = f:get_width("+") + pad * 2
+  renderer.draw_text(f, "+", tx + pad, y + (h - f:get_height()) / 2,
+    is_hovered("new") and style.accent or style.text)
+  table.insert(self.header_items, { kind = "new", x = tx, w = plus_w })
+end
+
+function TerminalView:header_item_at(x, y)
+  if y < self.position.y or y >= self:content_y() then return nil end
+  for _, item in ipairs(self.header_items) do
+    if x >= item.x and x < item.x + item.w then return item end
+  end
+end
+
+function TerminalView:header_click(x, y)
+  local item = self:header_item_at(x, y)
+  if item then
+    if item.kind == "tab" then
+      self:switch_session(item.index)
+    elseif item.kind == "close" then
+      self:close_session(item.index)
+    elseif item.kind == "new" then
+      self:spawn()
+    end
+  end
+  -- clicking the header focuses the drawer, unless the last shell just closed
+  if self.terminal and core.active_view ~= self then
+    self.return_view = core.active_view
+    core.set_active_view(self)
+  end
 end
 
 function TerminalView:convert_coordinates(x, y)
   local cw, lh = self:get_cell_size()
   local col_exact = math.floor((x - self.position.x - cfg.padding.x) / cw)
   local col_approx = common.round((x - self.position.x - cfg.padding.x) / cw)
-  local row = math.floor((y - self.position.y - cfg.padding.y) / lh)
+  local row = math.floor((y - self:content_y() - cfg.padding.y) / lh)
   return math.max(0, col_exact), math.max(0, row), math.max(0, col_approx)
 end
 
@@ -485,33 +701,44 @@ function TerminalView:get_word_boundaries(col, row)
   return last_space, row, next_space - 1, row
 end
 
-function TerminalView:send_mouse(button_code, col, row, release)
-  local mode = self.terminal:mouse_tracking_mode()
-  if mode == "sgr" then
-    self.terminal:input("\x1B[<" .. button_code .. ";" .. (col + 1) .. ";" .. (row + 1) .. (release and "m" or "M"))
-  elseif mode == "normal" or (mode == "x10" and not release) then
-    local b = release and 3 or button_code
-    self.terminal:input("\x1B[M" .. string.char(32 + b) .. string.char(32 + col + 1) .. string.char(32 + row + 1))
+local mouse_buttons = { left = 1, middle = 2, right = 3 }
+
+-- libvterm encodes the event in whatever protocol the program enabled
+function TerminalView:send_mouse(action, button, col, row)
+  local mods = {}
+  for _, m in ipairs({ "shift", "alt", "ctrl" }) do
+    if keymap.modkeys[m] then mods[#mods + 1] = m end
   end
+  self.terminal:mouse(action, button, col, row, table.concat(mods, "+"))
 end
 
 local function inverted()
   return cfg.inversion_key and keymap.modkeys[cfg.inversion_key]
 end
 
+-- whether mouse events go to the program instead of selecting text
+function TerminalView:tracking_mouse()
+  return self.terminal and not inverted() and self.terminal:mouse_tracking_mode() ~= nil
+end
+
 function TerminalView:on_mouse_pressed(button, x, y, clicks)
+  if y < self:content_y() then
+    if button == "left" then self:header_click(x, y) end
+    return true
+  end
   if TerminalView.super.on_mouse_pressed(self, button, x, y, clicks) then return true end
   if not self.terminal then return end
   local col, row = self:convert_coordinates(x, y)
+  if self:tracking_mouse() and mouse_buttons[button] then
+    self.mouse_button_down = mouse_buttons[button]
+    self:send_mouse("press", self.mouse_button_down, col, row)
+    return true
+  end
   if button == "middle" then
     command.perform("terminal:paste")
     return true
   end
   if button ~= "left" then return end
-  if not inverted() and self.terminal:mouse_tracking_mode() then
-    self:send_mouse(0, col, row)
-    return true
-  end
   local n = (clicks - 1) % 3 + 1
   if n == 1 then
     -- the selection starts where the button went down, not at the first move
@@ -533,10 +760,26 @@ end
 
 function TerminalView:on_mouse_moved(x, y, dx, dy)
   TerminalView.super.on_mouse_moved(self, x, y, dx, dy)
+  self.over_header = y >= self.position.y and y < self:content_y()
+  local hovered = self:header_item_at(x, y)
+  if hovered ~= self.hovered_header_item then
+    self.hovered_header_item = hovered
+    core.redraw = true
+  end
   if self.dragging_scrollbar or not self.terminal then return end
   self.mouse_x, self.mouse_y = x, y
+  if self:tracking_mouse() and y >= self:content_y() then
+    local mode = self.terminal:mouse_tracking_mode()
+    if mode == "move" or (mode == "drag" and self.mouse_button_down) then
+      local col, row = self:convert_coordinates(x, y)
+      if col ~= self.last_mouse_col or row ~= self.last_mouse_row then
+        self.last_mouse_col, self.last_mouse_row = col, row
+        self:send_mouse("move", 0, col, row)
+      end
+    end
+  end
   if not (self.pressing or self.word_selecting or self.row_selecting) then return end
-  if y < self.position.y then self.scrolling_offscreen = 1
+  if y < self:content_y() then self.scrolling_offscreen = 1
   elseif y > self.position.y + self.size.y then self.scrolling_offscreen = -1
   else self.scrolling_offscreen = nil end
   local col, line, col_approx = self:convert_coordinates(x, y)
@@ -567,22 +810,24 @@ end
 
 function TerminalView:on_mouse_released(button, x, y)
   TerminalView.super.on_mouse_released(self, button, x, y)
+  if self.terminal and self.mouse_button_down and self.mouse_button_down == mouse_buttons[button] then
+    local col, row = self:convert_coordinates(x, y)
+    self:send_mouse("release", self.mouse_button_down, col, row)
+    self.mouse_button_down = nil
+    return
+  end
   if button ~= "left" then return end
   self.pressing, self.word_selecting, self.row_selecting = false, nil, nil
   self.scrolling_offscreen = nil
   local s = self.selection
   if s and #s == 4 and s[1] == s[3] and s[2] == s[4] then self.selection = nil end
-  if self.terminal and not inverted() and self.terminal:mouse_tracking_mode() then
-    local col, row = self:convert_coordinates(x, y)
-    self:send_mouse(0, col, row, true)
-  end
 end
 
 function TerminalView:on_mouse_wheel(amount)
   if not self.terminal or not amount or amount == 0 then return end
-  if self.terminal:mouse_tracking_mode() and self.mouse_x then
+  if self:tracking_mouse() and self.mouse_x then
     local col, row = self:convert_coordinates(self.mouse_x, self.mouse_y)
-    self:send_mouse(amount > 0 and 64 or 65, col, row)
+    self:send_mouse("press", amount > 0 and 4 or 5, col, row)
   else
     local lines = math.max(1, math.floor(config.mouse_wheel_scroll / select(2, self:get_cell_size()) + 0.5))
     self.terminal:scrollback(math.max(0, self.terminal:scrollback() + (amount > 0 and lines or -lines)))
@@ -615,17 +860,21 @@ function TerminalView:get_selected_text()
     for i = 1, #line, 3 do
       local text = line[i + 2]
       local length = ulen(text)
+      local piece
       if idx == line1 and idx == line2 then
         if offset + length >= col1 and offset <= col2 then
-          out[#out + 1] = usub(text, math.max(col1 - offset, 0) + 1, math.min(col2 - offset, length))
+          piece = usub(text, math.max(col1 - offset, 0) + 1, math.min(col2 - offset, length))
         end
       elseif idx == line1 then
-        if offset + length >= col1 then out[#out + 1] = usub(text, math.max(col1 - offset, 0) + 1, length) end
+        if offset + length >= col1 then piece = usub(text, math.max(col1 - offset, 0) + 1, length) end
       elseif idx < line2 then
-        out[#out + 1] = text
+        piece = text
       elseif offset <= col2 then
-        out[#out + 1] = usub(text, 1, math.min(col2 - offset, length))
+        piece = usub(text, 1, math.min(col2 - offset, length))
       end
+      -- a wide character is padded with a space to span two columns; the copy leaves it out
+      if piece and is_wide(line[i]) then piece = piece:gsub("^([^\128-\191][\128-\191]*) ", "%1") end
+      out[#out + 1] = piece
       offset = offset + length
     end
   end
@@ -723,6 +972,12 @@ command.add(nil, {
       show_drawer(true)
     end
   end,
+  ["terminal:new-in-drawer"] = function()
+    -- a fresh drawer spawns its first shell on its own
+    local had_shell = drawer and drawer.terminal
+    show_drawer(true)
+    if had_shell then drawer:spawn() end
+  end,
   ["terminal:open-tab"] = function()
     local node = editor_node()
     local view = TerminalView(false)
@@ -794,7 +1049,9 @@ command.add(active_terminal, {
   ["terminal:clear"] = function() local v = core.active_view; v.terminal:clear(); v:input(cfg.newline) end,
   ["terminal:close"] = function()
     local v = core.active_view
-    v.terminal:close()
+    for i, s in ipairs(v.sessions) do
+      if s == v.terminal then v:close_session(i); break end
+    end
   end,
 })
 
@@ -825,6 +1082,7 @@ keymap.add {
   ["ctrl+shift+`"] = "terminal:open-tab",
   ["alt+t"] = "terminal:swap-drawer",
   ["alt+shift+t"] = "terminal:toggle-drawer",
+  ["alt+shift+n"] = "terminal:new-in-drawer",
 }
 
 local keys = {
