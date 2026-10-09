@@ -1187,7 +1187,7 @@ local GROUPS = {
   { id = "deleted", name = "Deleted files", statuses = { deleted = true } },
 }
 
-local git_panel = { id = "git", name = "Git", collapsed = {} }
+local git_panel = { id = "git", name = "Git", icon = "git", collapsed = {} }
 
 -- grouped, sorted file entries; rebuilt only when the status changes
 local function panel_groups()
