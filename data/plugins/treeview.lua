@@ -1,5 +1,6 @@
 local core = require "core"
 local common = require "core.common"
+local icons = require "core.icons"
 local command = require "core.command"
 local config = require "core.config"
 local keymap = require "core.keymap"
@@ -60,7 +61,7 @@ function TreeView:new()
   self.init_size = true
   self.cache = {}
   -- sidebar tabs; other plugins add theirs with add_panel()
-  self.panels = { { id = "project", name = "Project" } }
+  self.panels = { { id = "project", name = "Project", icon = "folder" } }
   self.panel = "project"
   self.panel_scroll = {}
 end
@@ -309,10 +310,9 @@ function TreeView:on_mouse_pressed(button, x, y, clicks)
     return
   elseif self.hovered_item.type == "dir" then
     self.hovered_item.expanded = not self.hovered_item.expanded
-  else
-    core.try(function()
-      core.root_view:open_doc(core.open_doc(self.hovered_item.filename))
-    end)
+  elseif button == "left" then
+    -- opened on release so the file can be dragged into a split instead
+    core.root_view:start_drag({ filename = self.hovered_item.filename }, x, y)
   end
 end
 
@@ -406,8 +406,12 @@ function TreeView:draw_tabs()
     if self.hovered_tab == p.id and not active then
       renderer.draw_rect(tx, y, tw2, h, style.line_highlight)
     end
-    local color = active and style.accent or style.dim
-    common.draw_text(style.sidebar_tab_font, color, p.name, "center", tx, y, tw2, h)
+    local color = (active or self.hovered_tab == p.id) and style.text or style.dim
+    if p.icon then
+      icons.draw(p.icon, color, tx, y, tw2, h)
+    else
+      common.draw_text(style.sidebar_tab_font, color, p.name, "center", tx, y, tw2, h)
+    end
     if active then
       local bar = math.max(2, math.floor(2 * SCALE))
       renderer.draw_rect(tx, y + h - bar, tw2, bar, style.caret)

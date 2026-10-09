@@ -173,31 +173,37 @@ function Node:split(dir, view, locked)
 end
 
 
-function Node:close_active_view(root)
-  local do_close = function()
-    if #self.views > 1 then
-      local idx = self:get_view_idx(self.active_view)
-      table.remove(self.views, idx)
+-- removes a view from this node, collapsing the node into its sibling if it was the last one
+function Node:remove_view(root, view)
+  if #self.views > 1 then
+    local idx = self:get_view_idx(view)
+    table.remove(self.views, idx)
+    if self.active_view == view then
       self:set_active_view(self.views[idx] or self.views[#self.views])
-    else
-      local parent = self:get_parent_node(root)
-      local is_a = (parent.a == self)
-      local other = parent[is_a and "b" or "a"]
-      if other:get_locked_size() then
-        self.views = {}
-        self:add_view(EmptyView())
-      else
-        parent:consume(other)
-        local p = parent
-        while p.type ~= "leaf" do
-          p = p[is_a and "a" or "b"]
-        end
-        p:set_active_view(p.active_view)
-      end
     end
-    core.last_active_view = nil
+  else
+    local parent = self:get_parent_node(root)
+    local is_a = (parent.a == self)
+    local other = parent[is_a and "b" or "a"]
+    if other:get_locked_size() then
+      self.views = {}
+      self:add_view(EmptyView())
+    else
+      parent:consume(other)
+      local p = parent
+      while p.type ~= "leaf" do
+        p = p[is_a and "a" or "b"]
+      end
+      p:set_active_view(p.active_view)
+    end
   end
-  self.active_view:try_close(do_close)
+  core.last_active_view = nil
+end
+
+
+function Node:close_active_view(root)
+  local view = self.active_view
+  view:try_close(function() self:remove_view(root, view) end)
 end
 
 
@@ -532,6 +538,8 @@ function RootView:on_mouse_pressed(button, x, y, clicks)
     if button == "middle"
     or (button == "left" and node:tab_close_overlapping_point(idx, x, y)) then
       node:close_active_view(self.root_node)
+    elseif button == "left" then
+      self:start_drag({ node = node, view = node.views[idx] }, x, y)
     end
   else
     core.set_active_view(node.active_view)
@@ -543,6 +551,9 @@ end
 function RootView:on_mouse_released(...)
   if self.dragged_divider then
     self.dragged_divider = nil
+  end
+  if self.dragged_tab then
+    self:end_drag()
   end
   self.root_node:on_mouse_released(...)
 end
@@ -566,6 +577,10 @@ function RootView:on_mouse_moved(x, y, dx, dy)
     return
   end
 
+  if self.dragged_tab then
+    self:update_drag(x, y)
+  end
+
   self.mouse.x, self.mouse.y = x, y
   self.root_node:on_mouse_moved(x, y, dx, dy)
 
@@ -578,6 +593,133 @@ function RootView:on_mouse_moved(x, y, dx, dy)
   else
     system.set_cursor(node.active_view.cursor)
   end
+end
+
+
+-- Dragging
+local drag_threshold = 6
+
+function RootView:start_drag(drag, x, y)
+  drag.x, drag.y = x, y
+  self.dragged_tab = drag
+  self.drop_target = nil
+end
+
+
+function RootView:get_drop_target(x, y)
+  local node = self.root_node:get_child_overlapping_point(x, y)
+  if node.type ~= "leaf" or node.locked or node:get_locked_size() then return end
+  local _, ty, _, th = node:get_tab_rect(1)
+  if node:has_tabs() and y < ty + th then
+    return { node = node, dir = "middle" }
+  end
+  local rx = (x - node.position.x) / node.size.x
+  local ry = (y - node.position.y) / node.size.y
+  local dir = "middle"
+  local edge = math.min(rx, 1 - rx, ry, 1 - ry)
+  if edge < 0.25 then
+    if edge == rx then dir = "left"
+    elseif edge == 1 - rx then dir = "right"
+    elseif edge == ry then dir = "up"
+    else dir = "down" end
+  end
+  return { node = node, dir = dir }
+end
+
+
+function RootView:update_drag(x, y)
+  local drag = self.dragged_tab
+  if not drag.moved then
+    if math.abs(x - drag.x) < drag_threshold and math.abs(y - drag.y) < drag_threshold then
+      return
+    end
+    drag.moved = true
+  end
+  core.redraw = true
+  self.drop_target = nil
+
+  -- reorder tabs within the source tab bar
+  if drag.view then
+    local node, views = drag.node, drag.node.views
+    local _, ty, tw, th = node:get_tab_rect(1)
+    if y >= ty and y < ty + th
+    and x >= node.position.x and x < node.position.x + node.size.x then
+      local from = node:get_view_idx(drag.view)
+      local to = node:get_tab_overlapping_point(x, y) or #views
+      if from and to ~= from then
+        table.remove(views, from)
+        table.insert(views, to, drag.view)
+        node.hovered_tab = to
+      end
+      return
+    end
+  end
+
+  local target = self:get_drop_target(x, y)
+  -- dropping a node's only tab back onto itself would do nothing
+  if target and drag.view and target.node == drag.node
+  and (#drag.node.views == 1 or target.dir == "middle") then
+    target = nil
+  end
+  self.drop_target = target
+end
+
+
+function RootView:end_drag()
+  local drag, target = self.dragged_tab, self.drop_target
+  self.dragged_tab, self.drop_target = nil, nil
+  core.redraw = true
+
+  if drag.filename then
+    if not drag.moved then
+      core.try(function() self:open_doc(core.open_doc(drag.filename)) end)
+    elseif target then
+      core.try(function()
+        local doc = core.open_doc(drag.filename)
+        if target.dir == "middle" then
+          core.set_active_view(target.node.active_view)
+          self:open_doc(doc)
+        else
+          target.node:split(target.dir, DocView(doc))
+        end
+      end)
+    end
+    return
+  end
+
+  if not target then return end
+  local view, src, dst = drag.view, drag.node, target.node
+  if src == dst then
+    src:remove_view(self.root_node, view)
+    src:split(target.dir, view)
+  else
+    if target.dir == "middle" then
+      dst:add_view(view)
+    else
+      dst:split(target.dir, view)
+    end
+    src:remove_view(self.root_node, view)
+    core.set_active_view(view)
+  end
+end
+
+
+function RootView:draw_drop_target()
+  local t = self.drop_target
+  if not t then return end
+  local x, y = t.node.position.x, t.node.position.y
+  local w, h = t.node.size.x, t.node.size.y
+  if t.dir == "left" then w = w / 2
+  elseif t.dir == "right" then x, w = x + w / 2, w / 2
+  elseif t.dir == "up" then h = h / 2
+  elseif t.dir == "down" then y, h = y + h / 2, h / 2 end
+  local c = style.accent
+  renderer.draw_rect(x, y, w, h, { c[1], c[2], c[3], 50 })
+  local b = style.divider_size * 2
+  renderer.draw_rect(x, y, w, b, c)
+  renderer.draw_rect(x, y + h - b, w, b, c)
+  renderer.draw_rect(x, y, b, h, c)
+  renderer.draw_rect(x + w - b, y, b, h, c)
 end
 
 
@@ -606,6 +748,7 @@ function RootView:draw()
     local t = table.remove(self.deferred_draws)
     t.fn(table.unpack(t))
   end
+  self:draw_drop_target()
 end
 
 
