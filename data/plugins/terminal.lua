@@ -3,6 +3,7 @@ local common = require "core.common"
 local config = require "core.config"
 local command = require "core.command"
 local keymap = require "core.keymap"
+local icons = require "core.icons"
 local style = require "core.style"
 local View = require "core.view"
 local StatusView = require "core.statusview"
@@ -646,6 +647,14 @@ function TerminalView:draw_header()
   renderer.draw_text(f, "+", tx + pad, y + (h - f:get_height()) / 2,
     is_hovered("new") and style.accent or style.text)
   table.insert(self.header_items, { kind = "new", x = tx, w = plus_w })
+  if self.drawer then
+    local label = "Hide"
+    local hw = f:get_width(label) + pad * 2
+    local hx = x + self.size.x - hw
+    renderer.draw_text(f, label, hx + pad, y + (h - f:get_height()) / 2,
+      is_hovered("hide") and style.accent or style.dim)
+    table.insert(self.header_items, { kind = "hide", x = hx, w = hw })
+  end
 end
 
 function TerminalView:header_item_at(x, y)
@@ -664,6 +673,9 @@ function TerminalView:header_click(x, y)
       self:close_session(item.index)
     elseif item.kind == "new" then
       self:spawn()
+    elseif item.kind == "hide" then
+      command.perform("terminal:toggle-drawer")
+      return
     end
   end
   -- clicking the header focuses the drawer, unless the last shell just closed
@@ -957,6 +969,37 @@ function StatusView:get_items()
     }
   end
   return old_get_items(self)
+end
+
+-- a terminal button at the right end of the status bar shows/hides the drawer
+local old_status_draw = StatusView.draw
+function StatusView:draw()
+  old_status_draw(self)
+  local w = icons.get_size("terminal") + style.padding.x * 2
+  local x = self.position.x + self.size.x - w
+  renderer.draw_rect(x, self.position.y, w, self.size.y, style.background2)
+  renderer.draw_rect(x, self.position.y + style.padding.y / 2,
+    style.divider_size, self.size.y - style.padding.y, style.divider)
+  local shown = drawer and drawer.visible
+  icons.draw("terminal", (shown or self.hovered_terminal_button) and style.text or style.dim,
+    x, self.position.y, w, self.size.y)
+  self.terminal_button_x = x
+end
+
+local old_status_moved = StatusView.on_mouse_moved
+function StatusView:on_mouse_moved(x, y, ...)
+  old_status_moved(self, x, y, ...)
+  self.hovered_terminal_button = self.terminal_button_x and x >= self.terminal_button_x
+  if self.hovered_terminal_button then self.cursor = "hand" else self.cursor = "arrow" end
+end
+
+local old_status_pressed = StatusView.on_mouse_pressed
+function StatusView:on_mouse_pressed(button, x, y, ...)
+  if self.terminal_button_x and x >= self.terminal_button_x then
+    command.perform("terminal:toggle-drawer")
+    return
+  end
+  return old_status_pressed(self, button, x, y, ...)
 end
 
 
