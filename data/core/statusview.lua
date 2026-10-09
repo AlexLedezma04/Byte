@@ -108,20 +108,13 @@ function StatusView:get_items()
       self.separator,
       string.format("%d%%", math.floor(line / #dv.doc.lines * 100)),
     }, {
-      style.icon_font, "g",
-      style.font, style.dim, self.separator2, style.text,
-      #dv.doc.lines, " lines",
+      style.text, #dv.doc.lines, " lines",
       self.separator,
       dv.doc.crlf and "CRLF" or "LF"
     }
   end
 
-  return {}, {
-    style.icon_font, "g",
-    style.font, style.dim, self.separator2,
-    #core.docs, style.text, " / ",
-    #core.project_files, " files"
-  }
+  return {}, {}
 end
 
 
