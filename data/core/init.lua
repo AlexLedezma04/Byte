@@ -130,6 +130,43 @@ local function load_session()
   end
 end
 
+-- folders opened before, newest first; listed when no folder is open
+local function recent_file()
+  return core.get_config_dir() .. PATHSEP .. "recent_folders"
+end
+
+local function load_recent()
+  core.recent_folders = {}
+  local fp = io.open(recent_file(), "r")
+  if not fp then return end
+  for line in fp:lines() do
+    if line ~= "" then table.insert(core.recent_folders, line) end
+  end
+  fp:close()
+end
+
+local function save_recent()
+  local fp = io.open(recent_file(), "w")
+  if not fp then return end
+  for _, dir in ipairs(core.recent_folders) do fp:write(dir, "\n") end
+  fp:close()
+end
+
+function core.remove_recent_folder(dir)
+  for i, d in ipairs(core.recent_folders) do
+    if d == dir then table.remove(core.recent_folders, i); break end
+  end
+  save_recent()
+  core.redraw = true
+end
+
+local function add_recent_folder(dir)
+  core.remove_recent_folder(dir)
+  table.insert(core.recent_folders, 1, dir)
+  while #core.recent_folders > 10 do table.remove(core.recent_folders) end
+  save_recent()
+end
+
 -- open docs keep working after the working directory changes
 local function make_doc_paths_absolute()
   for _, doc in ipairs(core.docs) do
@@ -145,6 +182,11 @@ local function folder_changed()
   core.redraw = true
 end
 
+-- rescans the project files now, e.g. after the sidebar changed them
+function core.rescan_project()
+  project_generation = project_generation + 1
+end
+
 -- opens `path` as the project folder; returns true on success
 function core.open_folder(path)
   local info = path and system.get_file_info(path)
@@ -158,6 +200,7 @@ function core.open_folder(path)
   core.project_dir = abs
   folder_changed()
   save_session()
+  add_recent_folder(abs)
   core.load_project_module()
   core.log_quiet("Opened folder %s", abs)
   return true
@@ -222,6 +265,8 @@ function core.init()
   local got_user_error = not core.try(require, "user")
   local got_project_error = not core.load_project_module()
   if core.project_dir then save_session() end
+  load_recent()
+  if core.project_dir then add_recent_folder(core.project_dir) end
 
   for _, filename in ipairs(files) do
     core.root_view:open_doc(core.open_doc(filename))

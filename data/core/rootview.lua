@@ -7,6 +7,7 @@ local Object = require "core.object"
 local View = require "core.view"
 local DocView = require "core.docview"
 local logo = require "core.logo"
+local ContextMenu = require "core.contextmenu"
 
 
 local EmptyView = View:extend()
@@ -62,9 +63,57 @@ end
 function EmptyView:draw()
   self:draw_background(style.background)
   local w, h = draw_text(0, 0, { 0, 0, 0, 0 })
+  -- recently opened folders, listed under the hints while no folder is open
+  local recent = (not core.project_dir and core.recent_folders) or {}
+  local rh = style.font:get_height() + style.padding.y
+  local list_h = #recent > 0 and (rh * (#recent + 1) + style.padding.y * 2) or 0
   local x = self.position.x + math.max(style.padding.x, (self.size.x - w) / 2)
-  local y = self.position.y + (self.size.y - h) / 2
+  local y = self.position.y + (self.size.y - h - list_h) / 2
   draw_text(x, y, style.dim)
+
+  self.recent_rows = {}
+  if #recent == 0 then return end
+  y = y + h + style.padding.y * 2
+  local lw = math.max(w, 400 * SCALE)
+  local lx = self.position.x + math.max(style.padding.x, (self.size.x - lw) / 2)
+  common.draw_text(style.font, style.dim, "Recent folders", nil, lx, y, 0, rh)
+  y = y + rh
+  local cw = style.font:get_width("×") + style.padding.x
+  for i, dir in ipairs(recent) do
+    local hovered = self.hovered_recent == i
+    if hovered then renderer.draw_rect(lx, y, lw, rh, style.line_highlight) end
+    local tx = common.draw_text(style.font, hovered and style.accent or style.text,
+      common.basename(dir), nil, lx + style.padding.x, y, 0, rh)
+    core.push_clip_rect(tx, y, math.max(0, lx + lw - cw - tx), rh)
+    common.draw_text(style.font, style.dim, "  " .. dir, nil, tx, y, 0, rh)
+    core.pop_clip_rect()
+    local close_hovered = hovered and self.hovered_recent_close
+    common.draw_text(style.font, close_hovered and style.accent or style.dim, "×",
+      "center", lx + lw - cw, y, cw, rh)
+    self.recent_rows[i] = { x = lx, y = y, w = lw, h = rh, close_x = lx + lw - cw, dir = dir }
+    y = y + rh
+  end
+end
+
+function EmptyView:on_mouse_moved(x, y)
+  self.hovered_recent, self.hovered_recent_close = nil, false
+  for i, r in ipairs(self.recent_rows or {}) do
+    if common.point_in_rect(x, y, r.x, r.y, r.w, r.h) then
+      self.hovered_recent, self.hovered_recent_close = i, x >= r.close_x
+    end
+  end
+  self.cursor = self.hovered_recent and "hand" or "arrow"
+end
+
+function EmptyView:on_mouse_pressed(button, x, y)
+  local r = self.hovered_recent and self.recent_rows[self.hovered_recent]
+  if not r or button ~= "left" then return end
+  if self.hovered_recent_close then
+    core.remove_recent_folder(r.dir)
+  elseif not core.open_folder(r.dir) then
+    core.remove_recent_folder(r.dir)
+  end
+  self.hovered_recent = nil
 end
 
 
@@ -264,7 +313,12 @@ end
 
 function Node:get_divider_drag_target()
   for _, child in ipairs({ self.a, self.b }) do
-    if child:get_locked_size() then
+    local cx, cy = child:get_locked_size()
+    if cx then
+      -- a collapsed panel (hidden drawer) has no divider to grab
+      if (self.type == "hsplit" and cx < 1) or (self.type == "vsplit" and cy < 1) then
+        return false
+      end
       local view = child.type == "leaf" and child.active_view
       return view and view.on_divider_dragged and view or false
     end
@@ -504,13 +558,33 @@ function RootView:get_active_node()
 end
 
 
-function RootView:open_doc(doc)
+-- the node new tabs go in: the active one, else the last used or first
+-- unlocked one (never the sidebar, terminal drawer or status bar)
+function RootView:get_editor_node()
   local node = self:get_active_node()
-  if node.locked and core.last_active_view then
-    core.set_active_view(core.last_active_view)
-    node = self:get_active_node()
+  if node and not node.locked then return node end
+  if core.last_active_view then
+    node = self.root_node:get_node_for_view(core.last_active_view)
+    if node and not node.locked then return node end
   end
-  assert(not node.locked, "Cannot open doc on locked node")
+  local function find(n)
+    if n.type == "leaf" then return not n.locked and n or nil end
+    return find(n.a) or find(n.b)
+  end
+  return find(self.root_node)
+end
+
+
+-- a tab stays a preview, replaced by the next file opened, until its doc
+-- is saved from then on or has unsaved edits
+local function is_preview(view)
+  return view.preview and view.doc.save_count == view.preview_saves
+    and not view.doc:is_dirty()
+end
+
+
+function RootView:open_doc(doc)
+  local node = self:get_editor_node()
   for i, view in ipairs(node.views) do
     if view.doc == doc then
       node:set_active_view(node.views[i])
@@ -518,14 +592,37 @@ function RootView:open_doc(doc)
     end
   end
   local view = doc.unreadable and UnreadableView(doc) or DocView(doc)
-  node:add_view(view)
-  self.root_node:update_layout()
+  if doc.filename then
+    self:add_preview_view(view)
+  else
+    node:add_view(view)
+    self.root_node:update_layout()
+  end
   view:scroll_to_line(view.doc:get_selection(), true, true)
   return view
 end
 
 
+-- opens `view` as a preview tab, in place of the current preview if any
+function RootView:add_preview_view(view)
+  local node = self:get_editor_node()
+  view.preview, view.preview_saves = true, view.doc.save_count
+  local idx
+  for i, v in ipairs(node.views) do
+    if is_preview(v) then idx = i end
+  end
+  if idx then
+    node.views[idx] = view
+    node:set_active_view(view)
+  else
+    node:add_view(view)
+  end
+  self.root_node:update_layout()
+end
+
+
 function RootView:on_mouse_pressed(button, x, y, clicks)
+  if ContextMenu.on_mouse_pressed(button, x, y) then return end
   local div = self.root_node:get_divider_overlapping_point(x, y)
   if div then
     self.dragged_divider = div
@@ -582,6 +679,7 @@ function RootView:on_mouse_moved(x, y, dx, dy)
   end
 
   self.mouse.x, self.mouse.y = x, y
+  if ContextMenu.on_mouse_moved(x, y) then return end
   self.root_node:on_mouse_moved(x, y, dx, dy)
 
   local node = self.root_node:get_child_overlapping_point(x, y)
@@ -749,6 +847,7 @@ function RootView:draw()
     t.fn(table.unpack(t))
   end
   self:draw_drop_target()
+  ContextMenu.draw()
 end
 
 

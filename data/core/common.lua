@@ -132,6 +132,12 @@ function common.basename(path)
 end
 
 
+-- everything before the last component: "/a/b/file.txt" -> "/a/b"
+function common.dirname(path)
+  return path:match("^(.+)[/\\][^/\\]*$") or path
+end
+
+
 -- quotes a string as one argument for the platform's shell
 function common.shell_quote(s)
   if PATHSEP == "\\" then

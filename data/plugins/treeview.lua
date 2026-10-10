@@ -7,6 +7,7 @@ local keymap = require "core.keymap"
 local style = require "core.style"
 local View = require "core.view"
 local logo = require "core.logo"
+local ContextMenu = require "core.contextmenu"
 
 config.treeview_size = 200 * SCALE
 config.treeview_min_size = 140 * SCALE
@@ -67,16 +68,23 @@ function TreeView:new()
 end
 
 
--- `panel` = { id, name, draw(view, x, y, w) -> content height,
---   on_mouse_moved(view, x, y), on_mouse_pressed(view, button, x, y, clicks) }
 function TreeView:add_panel(panel)
   table.insert(self.panels, panel)
   core.redraw = true
 end
 
 
-function TreeView:get_panel()
+function TreeView:get_shown_panels()
+  local t = {}
   for _, p in ipairs(self.panels) do
+    if not p.shown or p.shown() then t[#t + 1] = p end
+  end
+  return t
+end
+
+
+function TreeView:get_panel()
+  for _, p in ipairs(self:get_shown_panels()) do
     if p.id == self.panel then return p end
   end
   return self.panels[1]
@@ -174,7 +182,7 @@ end
 
 -- tab strip pinned to the top of the panel (hidden with a single panel)
 function TreeView:get_tabs_rect()
-  local h = #self.panels > 1 and self:get_item_height() + style.padding.y or 0
+  local h = #self:get_shown_panels() > 1 and self:get_item_height() + style.padding.y or 0
   return self.position.x, self.position.y, self.size.x, h
 end
 
@@ -300,6 +308,10 @@ function TreeView:on_mouse_pressed(button, x, y, clicks)
   if not core.project_dir then
     command.perform("core:open-folder")
     return
+  elseif button == "right" then
+    local item = self.hovered_item
+    self:show_file_menu(item and item.abs_filename, item and item.type, x, y)
+    return
   elseif self.hovered_header_close then
     command.perform("core:close-folder")
     return
@@ -398,8 +410,9 @@ function TreeView:draw_tabs()
   self.tab_rects = {}
   if h == 0 then return end
   renderer.draw_rect(x, y, w, h, style.background2)
-  local tw = w / #self.panels
-  for i, p in ipairs(self.panels) do
+  local panels = self:get_shown_panels()
+  local tw = w / #panels
+  for i, p in ipairs(panels) do
     local tx = x + math.floor((i - 1) * tw)
     local tw2 = math.floor(i * tw) - math.floor((i - 1) * tw)
     local active = p.id == self.panel
@@ -516,6 +529,79 @@ function TreeView:draw_footer()
   renderer.draw_rect(x, y, w, style.divider_size, style.divider)
   local lh = math.min(h - 4, style.sidebar_font:get_height() + 2)
   logo.draw_wordmark(x + style.padding.x, y + math.floor((h - lh) / 2), lh, style.accent)
+end
+
+
+-- file operations for the right-click menu
+local function check(ok, err)
+  if not ok then error(err, 0) end
+end
+
+local function delete_path(path)
+  local info = system.get_file_info(path)
+  if info and info.type == "dir" then
+    for _, name in ipairs(system.list_dir(path) or {}) do
+      delete_path(path .. PATHSEP .. name)
+    end
+  end
+  check(system.remove(path))
+end
+
+local function copy_path(src, dst)
+  local info = system.get_file_info(src)
+  if info and info.type == "dir" then
+    check(system.mkdir(dst))
+    for _, name in ipairs(system.list_dir(src) or {}) do
+      copy_path(src .. PATHSEP .. name, dst .. PATHSEP .. name)
+    end
+  else
+    check(system.copy_file(src, dst))
+  end
+end
+
+local function ask_path(label, text, fn)
+  core.command_view:set_text(text)
+  core.command_view:enter(label, function(path)
+    if path == "" then return end
+    if system.get_file_info(path) then
+      core.error("%s already exists", path)
+      return
+    end
+    core.try(fn, path)
+    core.rescan_project()
+  end, common.path_suggest)
+end
+
+-- menu for `path` (nil: the project folder); `type` is "dir" or "file"
+function TreeView:show_file_menu(path, type, x, y)
+  local dir = path and (type == "dir" and path or common.dirname(path)) or core.project_dir
+  local items = {}
+  if path then
+    table.insert(items, { "Copy", function()
+      ask_path("Copy To", path, function(dst) copy_path(path, dst) end)
+    end })
+    table.insert(items, { "Move", function()
+      ask_path("Move To", path, function(dst) check(system.rename(path, dst)) end)
+    end })
+    table.insert(items, { "Delete", function()
+      local name = common.basename(path)
+      if system.show_confirm_dialog("Delete", "Permanently delete \"" .. name .. "\"?") then
+        core.try(delete_path, path)
+        core.rescan_project()
+      end
+    end })
+  end
+  table.insert(items, { "New File", function()
+    ask_path("New File", dir .. PATHSEP, function(file)
+      local fp = assert(io.open(file, "w"))
+      fp:close()
+      core.root_view:open_doc(core.open_doc(file))
+    end)
+  end })
+  table.insert(items, { "New Directory", function()
+    ask_path("New Directory", dir .. PATHSEP, function(d) check(system.mkdir(d)) end)
+  end })
+  ContextMenu.show(items, x, y)
 end
 
 

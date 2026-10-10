@@ -5,6 +5,8 @@ local style = require "core.style"
 local keymap = require "core.keymap"
 local translate = require "core.doc.translate"
 local View = require "core.view"
+local command = require "core.command"
+local ContextMenu = require "core.contextmenu"
 
 
 local DocView = View:extend()
@@ -291,6 +293,17 @@ function DocView:on_mouse_pressed(button, x, y, clicks)
   end
   local caught = DocView.super.on_mouse_pressed(self, button, x, y, clicks)
   if caught then
+    return
+  end
+  if button == "right" then
+    if not self.doc:has_selection() then
+      self.doc:set_selection(self:resolve_screen_position(x, y))
+    end
+    ContextMenu.show({
+      { "Copy", function() command.perform("doc:copy") end },
+      { "Cut", function() command.perform("doc:cut") end },
+      { "Paste", function() command.perform("doc:paste") end },
+    }, x, y)
     return
   end
   if keymap.modkeys["shift"] then

@@ -122,6 +122,7 @@ function Doc:save(filename)
   self.filename = filename or self.filename
   self:reset_syntax()
   self:clean()
+  self.save_count = (self.save_count or 0) + 1
 end
 
 
