@@ -75,12 +75,17 @@ local function text_width(font, _, text, _, x)
 end
 
 
+function StatusView:get_items_width(items)
+  return draw_items(self, items, 0, 0, text_width)
+end
+
+
 function StatusView:draw_items(items, right_align, yoffset)
   local x, y = self:get_content_offset()
   y = y + (yoffset or 0)
   if right_align then
-    local w = draw_items(self, items, 0, 0, text_width)
-    x = x + self.size.x - w - style.padding.x
+    local w = self:get_items_width(items)
+    x = x + self.size.x - w - style.padding.x - (self.right_inset or 0)
     draw_items(self, items, x, y, common.draw_text)
   else
     x = x + style.padding.x

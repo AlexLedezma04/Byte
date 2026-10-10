@@ -648,11 +648,9 @@ function TerminalView:draw_header()
     is_hovered("new") and style.accent or style.text)
   table.insert(self.header_items, { kind = "new", x = tx, w = plus_w })
   if self.drawer then
-    local label = "Hide"
-    local hw = f:get_width(label) + pad * 2
+    local hw = icons.get_size("chevron_down") + pad * 2
     local hx = x + self.size.x - hw
-    renderer.draw_text(f, label, hx + pad, y + (h - f:get_height()) / 2,
-      is_hovered("hide") and style.accent or style.dim)
+    icons.draw("chevron_down", is_hovered("hide") and style.accent or style.dim, hx, y, hw, h)
     table.insert(self.header_items, { kind = "hide", x = hx, w = hw })
   end
 end
@@ -896,31 +894,10 @@ end
 
 local drawer
 
-local function editor_node()
-  local root = core.root_view.root_node
-  local node = core.root_view:get_active_node()
-  if node and not node.locked then return node end
-  if core.last_active_view then
-    node = root:get_node_for_view(core.last_active_view)
-    if node and not node.locked then return node end
-  end
-  local found
-  local function walk(n)
-    if found then return end
-    if n.type == "leaf" then
-      if not n.locked then found = n end
-    else
-      walk(n.a); walk(n.b)
-    end
-  end
-  walk(root)
-  return found
-end
-
 local function get_drawer()
   if not drawer then
     drawer = TerminalView(true)
-    local node = editor_node()
+    local node = core.root_view:get_editor_node()
     local last = core.active_view
     node:split("down", drawer, true)
     core.set_active_view(last)
@@ -974,8 +951,9 @@ end
 -- a terminal button at the right end of the status bar shows/hides the drawer
 local old_status_draw = StatusView.draw
 function StatusView:draw()
-  old_status_draw(self)
   local w = icons.get_size("terminal") + style.padding.x * 2
+  self.right_inset = w
+  old_status_draw(self)
   local x = self.position.x + self.size.x - w
   renderer.draw_rect(x, self.position.y, w, self.size.y, style.background2)
   renderer.draw_rect(x, self.position.y + style.padding.y / 2,
@@ -996,6 +974,7 @@ end
 local old_status_pressed = StatusView.on_mouse_pressed
 function StatusView:on_mouse_pressed(button, x, y, ...)
   if self.terminal_button_x and x >= self.terminal_button_x then
+    core.set_active_view(core.last_active_view)
     command.perform("terminal:toggle-drawer")
     return
   end
@@ -1022,7 +1001,7 @@ command.add(nil, {
     if had_shell then drawer:spawn() end
   end,
   ["terminal:open-tab"] = function()
-    local node = editor_node()
+    local node = core.root_view:get_editor_node()
     local view = TerminalView(false)
     node:add_view(view)
     core.root_view.root_node:update_layout()
