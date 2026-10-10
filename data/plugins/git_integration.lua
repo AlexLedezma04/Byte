@@ -350,6 +350,20 @@ function DocView:update()
   end
 end
 
+-- changed lines for the minimap, in the gutter's colors
+local function kind_color(c, kind)
+  return kind == "add" and c.added or kind == "del" and c.deleted or c.modified
+end
+
+function DocView:minimap_marks()
+  local st = cfg.gutter and not self.is_git_diff_view and doc_state[self.doc]
+  local c, marks = colors(), {}
+  for _, h in ipairs(st and st.hunks or {}) do
+    marks[#marks + 1] = { start = h.new_start, count = h.new_count, color = kind_color(c, h.kind) }
+  end
+  return marks
+end
+
 local old_draw_gutter = DocView.draw_line_gutter
 function DocView:draw_line_gutter(line, x, y)
   old_draw_gutter(self, line, x, y)
@@ -390,30 +404,13 @@ if ok_tv and type(tv) == "table" and tv.get_item_color then
   end
 end
 
--- status bar
-local function status_items()
-  local c, k = colors(), repo.counts
-  local t = { style.font, style.text, repo.branch or "?" }
-  if repo.ahead > 0 then t[#t + 1] = style.dim; t[#t + 1] = " ahead " .. repo.ahead end
-  if repo.behind > 0 then t[#t + 1] = style.dim; t[#t + 1] = " behind " .. repo.behind end
-  local function add(n, color, sign)
-    if n > 0 then t[#t + 1] = color; t[#t + 1] = "  " .. sign .. n end
+-- status bar: just the branch name, shortened with "…" to the room left
+local function fit(font, text, room)
+  if font:get_width(text) <= room then return text end
+  while #text > 0 and font:get_width(text .. "…") > room do
+    text = text:sub(1, -2):gsub("[\128-\191]+$", ""):gsub("[\192-\255]$", "")
   end
-  add(k.added, c.added, "+")
-  add(k.modified, c.modified, "~")
-  add(k.deleted, c.deleted, "-")
-  add(k.untracked, c.untracked, "?")
-  add(k.conflict, c.conflict, "!")
-  return t
-end
-
-local function items_width(items)
-  local font, w = style.font, 0
-  for _, item in ipairs(items) do
-    if type(item) == "userdata" then font = item
-    elseif type(item) ~= "table" then w = w + font:get_width(tostring(item)) end
-  end
-  return w
+  return #text > 0 and text .. "…" or ""
 end
 
 local old_get_items = StatusView.get_items
@@ -421,19 +418,25 @@ function StatusView:get_items()
   local left, right = old_get_items(self)
   self.git_click_x = nil
   if cfg.statusbar and repo.root then
-    local items = status_items()
-    self.git_click_x = self.position.x + self.size.x - style.padding.x - items_width(items)
-    right[#right + 1] = style.font
-    right[#right + 1] = style.dim
-    right[#right + 1] = self.separator2
-    for _, item in ipairs(items) do right[#right + 1] = item end
+    local font, pad = style.font, style.padding.x
+    local sep = #right > 0 and self.separator2 or ""
+    local room = self.size.x - (self.right_inset or 0) - pad * 3
+      - self:get_items_width(left) - self:get_items_width(right) - font:get_width(sep)
+    local name = fit(font, repo.branch or "?", room)
+    if name ~= "" then
+      local w = font:get_width(name)
+      self.git_click_x = self.position.x + self.size.x - (self.right_inset or 0) - pad - w
+      self.git_click_w = w
+      local t = { font, style.dim, sep, style.text, name }
+      for _, item in ipairs(t) do right[#right + 1] = item end
+    end
   end
   return left, right
 end
 
 local old_sv_pressed = StatusView.on_mouse_pressed
 function StatusView:on_mouse_pressed(button, x, y, clicks)
-  if self.git_click_x and x >= self.git_click_x then
+  if self.git_click_x and x >= self.git_click_x and x < self.git_click_x + self.git_click_w then
     core.set_active_view(core.last_active_view)
     command.perform("git:show-changes")
     return
@@ -444,6 +447,7 @@ end
 -- compare view: HEAD on the left (read-only), the working copy on the right.
 local CompareView = DocView:extend()
 CompareView.is_git_diff_view = true
+CompareView.has_minimap = true
 
 -- read-only Doc used only for syntax highlighting
 local function snapshot_doc(filename, lines)
@@ -529,7 +533,8 @@ function CompareView:get_pane_layout()
   local digits = math.max(old_n, #self.doc.lines, 99)
   local gutter = font:get_width(tostring(digits)) + style.padding.x * 2
   local half = math.floor(self.size.x / 2)
-  local text_w = self.size.x - half - gutter - style.scrollbar_size
+  local minimap = self.get_minimap_width and self:get_minimap_width() or 0
+  local text_w = self.size.x - half - gutter - style.scrollbar_size - minimap
   return half, gutter, text_w
 end
 
@@ -844,13 +849,65 @@ function CompareView:draw()
   common.draw_text(regular, style.dim, info, nil, x, py, 0, hh)
   core.pop_clip_rect()
 
+  if self.draw_minimap then self:draw_minimap() end
   self:draw_scrollbar()
+end
+
+-- minimap: one row per aligned row, the working copy where it has a line
+local function no_tokens() return function() end end
+
+function CompareView:minimap_row_count() return self:get_row_count() end
+
+function CompareView:minimap_each_token(i)
+  local row = self.rows[i]
+  if not row then return no_tokens() end
+  if row.r and not self.read_only then return self.doc.highlighter:each_token(row.r) end
+  if row.l and self.old_doc then return self.old_doc.highlighter:each_token(row.l) end
+  return no_tokens()
+end
+
+function CompareView:minimap_caret_row()
+  if self.read_only then return nil end
+  return self:row_of((self.doc:get_selection()))
+end
+
+function CompareView:minimap_header_height() return self:get_header_height() end
+
+function CompareView:minimap_rows_offset()
+  return self:get_header_height() + style.padding.y
+end
+
+function CompareView:minimap_marks()
+  local c, marks, cur = colors(), {}, nil
+  for i, row in ipairs(self.rows) do
+    if row.kind ~= "same" and cur and cur.kind == row.kind and cur.start + cur.count == i then
+      cur.count = cur.count + 1
+    elseif row.kind ~= "same" then
+      cur = { start = i, count = 1, kind = row.kind, color = kind_color(c, row.kind) }
+      marks[#marks + 1] = cur
+    end
+  end
+  return marks
+end
+
+-- a deleted file: its last committed version, read-only, in a single pane
+local function open_deleted(abs)
+  local rel = repo.root and rel_path(abs)
+  local text = rel and git(repo.root, { "show", "HEAD:" .. rel }) or ""
+  local doc = read_only(snapshot_doc(abs, split_lines(text)))
+  local view = DocView(doc)
+  view.abs, view.git_deleted = abs, true
+  view.get_name = function() return "Deleted: " .. common.basename(abs) end
+  -- the whole file is a removal
+  view.minimap_marks = function() return { { start = 1, count = #doc.lines, color = colors().deleted } } end
+  core.root_view:add_preview_view(view)
+  return view
 end
 
 -- opens (or focuses) the compare view for `abs` in the editor area
 local function open_compare(abs, status)
   for _, v in ipairs(core.root_view.root_node:get_children()) do
-    if v.is_git_diff_view and v.abs == abs then
+    if (v.is_git_diff_view or v.git_deleted) and v.abs == abs then
       v.status = status or v.status
       local node = core.root_view.root_node:get_node_for_view(v)
       node:set_active_view(v)
@@ -858,14 +915,16 @@ local function open_compare(abs, status)
       return v
     end
   end
-  local node = core.root_view:get_active_node()
-  if node.locked and core.last_active_view then
-    core.set_active_view(core.last_active_view)
-    node = core.root_view:get_active_node()
+  status = status or repo.files[abs] or "modified"
+  -- nothing to compare against: new files open as normal tabs, deleted ones
+  -- as a read-only view of what was removed
+  if status == "untracked" or status == "added" then
+    return core.root_view:open_doc(core.open_doc(abs))
+  elseif status == "deleted" then
+    return open_deleted(abs)
   end
-  local view = CompareView(abs, status or repo.files[abs] or "modified")
-  node:add_view(view)
-  core.root_view.root_node:update_layout()
+  local view = CompareView(abs, status)
+  core.root_view:add_preview_view(view)
   core.redraw = true
   return view
 end
@@ -1189,6 +1248,9 @@ local GROUPS = {
 
 local git_panel = { id = "git", name = "Git", icon = "git", collapsed = {} }
 
+-- no repository, no git UI; the tab comes back as soon as one is detected
+function git_panel.shown() return repo.root ~= nil end
+
 -- grouped, sorted file entries; rebuilt only when the status changes
 local function panel_groups()
   if git_panel.cache_sig == repo.signature and git_panel.cache_root == repo.root then
@@ -1245,7 +1307,7 @@ function git_panel.draw(view, x, y, w)
     style.divider_size, style.divider)
 
   local active = core.active_view
-  local active_abs = active and active.is_git_diff_view and active.abs
+  local active_abs = active and (active.is_git_diff_view or active.git_deleted) and active.abs
   local icon_w = style.icon_font:get_width("D")
   local chevron_w = style.icon_font:get_width("+")
   local guide_color = { style.dim[1], style.dim[2], style.dim[3], 110 }
@@ -1322,6 +1384,10 @@ end
 
 function git_panel.on_mouse_pressed(view, button, px, py)
   local hit = panel_hit(py)
+  if hit and hit.file and button == "right" then
+    view:show_file_menu(hit.file.abs, "file", px, py)
+    return
+  end
   if not hit or button ~= "left" then return end
   if hit.group then
     git_panel.collapsed[hit.group] = not git_panel.collapsed[hit.group]
@@ -1337,7 +1403,9 @@ end
 
 command.add(nil, {
   ["git:refresh"] = request_refresh,
+})
 
+command.add(function() return repo.root ~= nil end, {
   ["git:show-changes"] = function()
     if not (ok_tv and tv.set_panel) then return end
     tv.visible = true
