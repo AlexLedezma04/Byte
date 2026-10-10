@@ -229,6 +229,35 @@ static int f_chdir(lua_State *L) {
 }
 
 
+static int push_result(lua_State *L, bool ok) {
+  if (ok) { lua_pushboolean(L, 1); return 1; }
+  lua_pushnil(L);
+  lua_pushstring(L, SDL_GetError());
+  return 2;
+}
+
+
+static int f_mkdir(lua_State *L) {
+  return push_result(L, SDL_CreateDirectory(luaL_checkstring(L, 1)));
+}
+
+
+/* removes a file or an empty directory */
+static int f_remove(lua_State *L) {
+  return push_result(L, SDL_RemovePath(luaL_checkstring(L, 1)));
+}
+
+
+static int f_rename(lua_State *L) {
+  return push_result(L, SDL_RenamePath(luaL_checkstring(L, 1), luaL_checkstring(L, 2)));
+}
+
+
+static int f_copy_file(lua_State *L) {
+  return push_result(L, SDL_CopyFile(luaL_checkstring(L, 1), luaL_checkstring(L, 2)));
+}
+
+
 static int f_list_dir(lua_State *L) {
   const char *path = luaL_checkstring(L, 1);
 
@@ -385,6 +414,10 @@ static const luaL_Reg lib[] = {
   { "show_confirm_dialog", f_show_confirm_dialog },
   { "chdir",               f_chdir               },
   { "list_dir",            f_list_dir            },
+  { "mkdir",               f_mkdir               },
+  { "remove",              f_remove              },
+  { "rename",              f_rename              },
+  { "copy_file",           f_copy_file           },
   { "absolute_path",       f_absolute_path       },
   { "get_file_info",       f_get_file_info       },
   { "get_clipboard",       f_get_clipboard       },
