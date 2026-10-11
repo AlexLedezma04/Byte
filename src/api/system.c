@@ -10,6 +10,9 @@
 #include "rencache.h"
 #ifdef _WIN32
   #include <windows.h>
+  #include <shobjidl.h>
+#else
+  #include <sys/wait.h>
 #endif
 
 extern SDL_Window *window;
@@ -378,6 +381,108 @@ static int f_exec(lua_State *L) {
 }
 
 
+static int f_capture(lua_State *L) {
+  const char *cmd = luaL_checkstring(L, 1);
+  luaL_Buffer b;
+#if _WIN32
+  SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+  HANDLE rd, wr;
+  if (!CreatePipe(&rd, &wr, &sa, 0)) { lua_pushnil(L); lua_pushinteger(L, -1); return 2; }
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+  int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, NULL, 0);
+  wchar_t *line = malloc((len + 16) * sizeof(wchar_t));
+  if (!line) { CloseHandle(rd); CloseHandle(wr); luaL_error(L, "buffer allocation failed"); }
+  wcscpy(line, L"cmd.exe /c ");
+  MultiByteToWideChar(CP_UTF8, 0, cmd, -1, line + wcslen(line), len);
+
+  STARTUPINFOW si = { sizeof(si) };
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = wr;
+  si.hStdError = wr;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  PROCESS_INFORMATION pi;
+  BOOL ok = CreateProcessW(NULL, line, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                           NULL, NULL, &si, &pi);
+  free(line);
+  CloseHandle(wr);
+  if (!ok) { CloseHandle(rd); lua_pushnil(L); lua_pushinteger(L, -1); return 2; }
+
+  luaL_buffinit(L, &b);
+  char chunk[4096];
+  DWORD n;
+  while (ReadFile(rd, chunk, sizeof(chunk), &n, NULL) && n > 0) {
+    luaL_addlstring(&b, chunk, n);
+  }
+  CloseHandle(rd);
+  DWORD code = 0;
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
+  luaL_pushresult(&b);
+  lua_pushinteger(L, (lua_Integer) code);
+#else
+  FILE *fp = popen(cmd, "r");
+  if (!fp) { lua_pushnil(L); lua_pushinteger(L, -1); return 2; }
+  luaL_buffinit(L, &b);
+  char chunk[4096];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+    luaL_addlstring(&b, chunk, n);
+  }
+  int status = pclose(fp);
+  luaL_pushresult(&b);
+  lua_pushinteger(L, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+#endif
+  return 2;
+}
+
+
+#if _WIN32
+static int f_pick_folder(lua_State *L) {
+  const char *start = luaL_optstring(L, 1, NULL);
+  char path[MAX_PATH * 4];
+  int found = 0;
+  HRESULT init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  IFileOpenDialog *dlg;
+  if (SUCCEEDED(CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
+                                 &IID_IFileOpenDialog, (void**) &dlg))) {
+    FILEOPENDIALOGOPTIONS opts;
+    dlg->lpVtbl->GetOptions(dlg, &opts);
+    dlg->lpVtbl->SetOptions(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+    dlg->lpVtbl->SetTitle(dlg, L"Open Folder - Byte");
+    if (start) {
+      wchar_t wstart[MAX_PATH];
+      IShellItem *folder;
+      if (MultiByteToWideChar(CP_UTF8, 0, start, -1, wstart, MAX_PATH) &&
+          SUCCEEDED(SHCreateItemFromParsingName(wstart, NULL, &IID_IShellItem, (void**) &folder))) {
+        dlg->lpVtbl->SetFolder(dlg, folder);
+        folder->lpVtbl->Release(folder);
+      }
+    }
+    HWND owner = (HWND) SDL_GetPointerProperty(SDL_GetWindowProperties(window),
+      SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    IShellItem *item;
+    if (SUCCEEDED(dlg->lpVtbl->Show(dlg, owner)) &&
+        SUCCEEDED(dlg->lpVtbl->GetResult(dlg, &item))) {
+      wchar_t *wpath;
+      if (SUCCEEDED(item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH, &wpath))) {
+        found = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path), NULL, NULL) > 0;
+        CoTaskMemFree(wpath);
+      }
+      item->lpVtbl->Release(item);
+    }
+    dlg->lpVtbl->Release(dlg);
+  }
+  if (SUCCEEDED(init)) { CoUninitialize(); }
+  if (!found) { return 0; }
+  lua_pushstring(L, path);
+  return 1;
+}
+#endif
+
+
 static int f_fuzzy_match(lua_State *L) {
   const char *str = luaL_checkstring(L, 1);
   const char *ptn = luaL_checkstring(L, 2);
@@ -425,6 +530,10 @@ static const luaL_Reg lib[] = {
   { "get_time",            f_get_time            },
   { "sleep",               f_sleep               },
   { "exec",                f_exec                },
+  { "capture",             f_capture             },
+#if _WIN32
+  { "pick_folder",         f_pick_folder         },
+#endif
   { "fuzzy_match",         f_fuzzy_match         },
   { NULL, NULL }
 };

@@ -14,7 +14,7 @@ gcc src/*.c src/api/*.c src/lib/lua/*.c src/lib/stb/*.c src/lib/libterminal/*.c 
     -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections^
     -std=gnu11 -fno-strict-aliasing -Isrc^
     -Iwinlib/SDL3-3.4.18/x86_64-w64-mingw32/include^
-    -lmingw32 -lm -lSDL3 -Lwinlib/SDL3-3.4.18/x86_64-w64-mingw32/lib^
+    -lmingw32 -lm -lSDL3 -lole32 -luuid -lshell32 -Lwinlib/SDL3-3.4.18/x86_64-w64-mingw32/lib^
     -mwindows build/res.res^
     -o build/byte.exe
 del build\res.res

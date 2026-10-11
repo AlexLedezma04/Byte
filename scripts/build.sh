@@ -30,7 +30,7 @@ if [[ $* == *windows* ]]; then
     cflags="$cflags -Iwinlib/SDL3-3.4.18/x86_64-w64-mingw32/include"
     lflags="$lflags -Lwinlib/SDL3-3.4.18/x86_64-w64-mingw32/lib -lSDL3"
   fi
-  lflags="-lmingw32 $lflags -mwindows -o $outfile build/obj/res.res"
+  lflags="-lmingw32 $lflags -lole32 -luuid -lshell32 -mwindows -o $outfile build/obj/res.res"
   x86_64-w64-mingw32-windres resources/res.rc -O coff -o build/obj/res.res
 else
   platform="unix"
