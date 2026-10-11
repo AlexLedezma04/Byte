@@ -55,10 +55,8 @@ local function git(cwd, args)
   for _, a in ipairs(args) do cmd[#cmd + 1] = quote(a) end
   local line = table.concat(cmd, " ") .. (is_windows and " 2>NUL" or " 2>/dev/null")
   if is_windows then line = '"' .. line .. '"' end
-  local fp = io.popen(line, "r")
-  if not fp then return nil, -1 end
-  local out = fp:read("*a")
-  local _, _, code = fp:close()
+  local out, code = system.capture(line)
+  if not out then return nil, -1 end
   local _, is_main = coroutine.running()
   if not is_main then coroutine.yield() end
   return out, code or 0
