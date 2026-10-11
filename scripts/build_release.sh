@@ -17,16 +17,16 @@ pack() {
 }
 
 scripts/build.sh release
-pack byte-linux.zip build/byte
+pack byte-linux-amd64.zip build/byte
 
 if command -v x86_64-w64-mingw32-gcc >/dev/null; then
   scripts/build.sh release windows
   if [[ -d build/deps/sdl3-windows ]]; then
-    pack byte-windows.zip build/byte.exe
+    pack byte-windows-amd64.zip build/byte.exe
   else
     x86_64-w64-mingw32-strip -o build/SDL3.dll \
       winlib/SDL3-3.4.18/x86_64-w64-mingw32/bin/SDL3.dll
-    pack byte-windows.zip build/byte.exe build/SDL3.dll
+    pack byte-windows-amd64.zip build/byte.exe build/SDL3.dll
     rm build/SDL3.dll
   fi
 else

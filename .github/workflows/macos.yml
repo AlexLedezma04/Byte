@@ -1,5 +1,3 @@
-# builds Byte.app (universal: Apple Silicon + Intel) and uploads
-# byte-macos.zip; run it from the Actions tab, or push a v* tag
 name: macos
 
 on:
@@ -13,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # tags, for the version in Info.plist
+          fetch-depth: 0
       - run: brew install pkg-config
       - uses: actions/cache@v4
         with:
@@ -24,5 +22,5 @@ jobs:
       - run: scripts/build_mac_app.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: byte-macos
-          path: build/byte-macos.zip
+          name: byte-macos-universal
+          path: build/byte-macos-universal.zip

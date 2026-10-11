@@ -56,6 +56,6 @@ EOF
 
 codesign --force --deep --sign - "$app"
 
-rm -f build/byte-macos.zip
-ditto -c -k --keepParent "$app" build/byte-macos.zip
-echo "packed: build/byte-macos.zip ($(du -h build/byte-macos.zip | cut -f1))"
+rm -f build/byte-macos-universal.zip
+ditto -c -k --keepParent "$app" build/byte-macos-universal.zip
+echo "packed: build/byte-macos-universal.zip ($(du -h build/byte-macos-universal.zip | cut -f1))"
