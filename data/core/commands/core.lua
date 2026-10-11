@@ -11,17 +11,17 @@ local fullscreen = false
 -- folder picker typed into the command view, suggesting only folders
 local function pick_folder_with_command_view()
   core.command_view:enter("Open Folder", function(text)
-    text = text:gsub("^~", os.getenv("HOME") or "~")
+    text = text:gsub("^~", core.home_dir())
     core.open_folder(text)
   end, function(text)
-    text = text:gsub("^~", os.getenv("HOME") or "~")
+    text = text:gsub("^~", core.home_dir())
     local res = {}
     for _, path in ipairs(common.path_suggest(text)) do
       if path:sub(-1) == PATHSEP then table.insert(res, path) end
     end
     return res
   end)
-  local start = core.project_dir or os.getenv("HOME") or ""
+  local start = core.project_dir or core.home_dir()
   core.command_view:set_text(start .. PATHSEP)
 end
 
@@ -45,6 +45,11 @@ end
 local shell_quote = common.shell_quote
 
 local function pick_folder_with_dialog()
+  if system.pick_folder then  -- windows
+    local path = system.pick_folder(core.project_dir or core.home_dir())
+    if path then core.open_folder(path) end
+    return true
+  end
   local tool = find_dialog_tool()
   if not tool then return false end
   local start = (core.project_dir or os.getenv("HOME") or "/") .. "/"

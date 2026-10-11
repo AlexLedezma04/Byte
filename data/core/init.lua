@@ -85,16 +85,16 @@ end
 
 
 -- folder handling
-local function home_dir()
+function core.home_dir()
   return os.getenv("HOME") or os.getenv("USERPROFILE") or "/"
 end
 
 function core.get_config_dir()
   local base = os.getenv("XDG_CONFIG_HOME")
   if PATHSEP == "\\" then
-    base = os.getenv("APPDATA") or home_dir()
+    base = os.getenv("APPDATA") or core.home_dir()
   elseif not base or base == "" then
-    base = home_dir() .. "/.config"
+    base = core.home_dir() .. "/.config"
   end
   return base .. PATHSEP .. "byte"
 end
@@ -106,11 +106,7 @@ end
 local function save_session()
   local dir = core.get_config_dir()
   if not system.get_file_info(dir) then
-    if PATHSEP == "\\" then
-      os.execute('mkdir "' .. dir .. '"')
-    else
-      os.execute("mkdir -p '" .. dir:gsub("'", "'\\''") .. "'")
-    end
+    system.mkdir(dir)  -- creates missing parents too
   end
   local fp = io.open(session_file(), "w")
   if fp then
@@ -210,7 +206,7 @@ end
 function core.close_folder()
   if not core.project_dir then return end
   make_doc_paths_absolute()
-  system.chdir(home_dir())
+  system.chdir(core.home_dir())
   core.project_dir = nil
   folder_changed()
   save_session()
@@ -241,7 +237,7 @@ function core.init()
     system.chdir(project_dir)
     core.project_dir = project_dir
   else
-    system.chdir(home_dir())
+    system.chdir(core.home_dir())
   end
 
   core.frame_start = 0
